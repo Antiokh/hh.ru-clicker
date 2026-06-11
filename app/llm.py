@@ -225,11 +225,14 @@ def _generate_openclaw_reply(messages: list, account_key: str = "") -> str:
             if role == "user":
                 last_employer_text = content[:1600]
     prompt = (
-        "Нужно ответить работодателю на hh.ru. Верни только готовый текст ответа от имени соискателя, "
-        "без Markdown, без пояснений, без префиксов вроде 'Ответ:'.\n\n"
-        f"Сообщение работодателя:\n{last_employer_text}\n\n"
-        f"[instructions]\n{system_text}\n\n[conversation]\n"
-        + "\n\n---\n\n".join(chat_lines[-6:])
+        "Составь короткий ответ работодателю на hh.ru от имени соискателя.\n"
+        "Верни только готовый текст ответа, без Markdown, пояснений и префикса 'Ответ:'.\n"
+        "Соблюдай язык сообщения работодателя. Не выдумывай факты, даты, зарплату или договорённости.\n"
+        f"Дополнительные правила профиля:\n{system_text[:1800]}\n\n"
+        "Контекст переписки:\n"
+        + "\n\n---\n\n".join(chat_lines[-4:])
+        + "\n\nГлавное сообщение работодателя, на которое нужно ответить:\n"
+        f"{last_employer_text}\n"
     )
     openclaw_cmd = _openclaw_command()
     if not openclaw_cmd:
@@ -263,6 +266,7 @@ def _generate_openclaw_reply(messages: list, account_key: str = "") -> str:
             text = str((data.get("result") or {}).get("finalAssistantVisibleText") or data.get("finalAssistantVisibleText") or "").strip()
         if not text and raw and not raw.lstrip().startswith("{"):
             text = raw.strip()
+        text = _clean_openclaw_reply(text)
         if text:
             _track_usage(account_key, "reply")
         else:
@@ -297,6 +301,29 @@ def _parse_openclaw_json(raw: str) -> dict:
     if start >= 0 and end > start:
         return json.loads(raw[start:end + 1])
     return {}
+
+
+def _clean_openclaw_reply(text: str) -> str:
+    text = (text or "").strip()
+    if not text:
+        return ""
+    bold = re.findall(r"\*\*([\s\S]+?)\*\*", text)
+    if bold:
+        text = max(bold, key=len).strip()
+    lines = []
+    for line in text.splitlines():
+        stripped = line.strip()
+        lower = stripped.lower()
+        if not stripped:
+            continue
+        if lower.startswith(("конечно", "вот ", "вариант", "если хочешь", "если нужно", "могу сразу")):
+            continue
+        lines.append(stripped)
+    text = "\n".join(lines).strip()
+    text = re.sub(r"^\s*ответ\s*:\s*", "", text, flags=re.I)
+    text = text.replace("готов(а)", "готов").replace("Готов(а)", "Готов")
+    text = text.replace("**", "").strip()
+    return text
 
 
 def _extract_json(raw: str) -> dict | None:

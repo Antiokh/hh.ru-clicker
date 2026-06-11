@@ -82,3 +82,16 @@ def test_generate_openclaw_reply_accepts_plain_text(monkeypatch):
     )
 
     assert result == "Готов обсудить детали."
+
+
+def test_clean_openclaw_reply_removes_explanatory_wrapper():
+    raw = (
+        "Конечно — вот короткий вариант:\n\n"
+        "**Здравствуйте! Спасибо за отклик. Вакансия мне интересна, готов(а) обсудить детали.**\n\n"
+        "Если хочешь, могу сделать ещё варианты."
+    )
+
+    assert (
+        llm._clean_openclaw_reply(raw)
+        == "Здравствуйте! Спасибо за отклик. Вакансия мне интересна, готов обсудить детали."
+    )
