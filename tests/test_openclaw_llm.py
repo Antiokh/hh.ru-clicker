@@ -2,7 +2,7 @@ import json
 import subprocess
 
 from app import llm
-from app.config import CONFIG
+from app.config import CONFIG, applicant_gender_forms, questionnaire_default_answer
 
 
 def test_parse_openclaw_json_direct_payload():
@@ -84,7 +84,8 @@ def test_generate_openclaw_reply_accepts_plain_text(monkeypatch):
     assert result == "Готов обсудить детали."
 
 
-def test_clean_openclaw_reply_removes_explanatory_wrapper():
+def test_clean_openclaw_reply_removes_explanatory_wrapper(monkeypatch):
+    monkeypatch.setattr(CONFIG, "llm_applicant_gender", "male")
     raw = (
         "Конечно — вот короткий вариант:\n\n"
         "**Здравствуйте! Спасибо за отклик. Вакансия мне интересна, готов(а) обсудить детали.**\n\n"
@@ -95,3 +96,28 @@ def test_clean_openclaw_reply_removes_explanatory_wrapper():
         llm._clean_openclaw_reply(raw)
         == "Здравствуйте! Спасибо за отклик. Вакансия мне интересна, готов обсудить детали."
     )
+
+
+def test_applicant_gender_forms_default_female(monkeypatch):
+    monkeypatch.setattr(CONFIG, "llm_applicant_gender", "female")
+    forms = applicant_gender_forms()
+    assert forms["responded"] == "соискатель откликнулась"
+    assert forms["consistency"] == "будь последовательна"
+    assert llm._clean_openclaw_reply("Готов(а) обсудить детали.") == "Готова обсудить детали."
+
+
+def test_applicant_gender_forms_male(monkeypatch):
+    monkeypatch.setattr(CONFIG, "llm_applicant_gender", "male")
+    forms = applicant_gender_forms()
+    assert forms["responded"] == "соискатель откликнулся"
+    assert forms["consistency"] == "будь последователен"
+    assert llm._clean_openclaw_reply("Готов(а) обсудить детали.") == "Готов обсудить детали."
+
+
+def test_questionnaire_default_answer_uses_gender_until_customized(monkeypatch):
+    monkeypatch.setattr(CONFIG, "questionnaire_default_answer", "Готова рассказать подробнее на собеседовании.")
+    monkeypatch.setattr(CONFIG, "llm_applicant_gender", "male")
+    assert questionnaire_default_answer() == "Готов рассказать подробнее на собеседовании."
+
+    monkeypatch.setattr(CONFIG, "questionnaire_default_answer", "Мой кастомный ответ.")
+    assert questionnaire_default_answer() == "Мой кастомный ответ."
