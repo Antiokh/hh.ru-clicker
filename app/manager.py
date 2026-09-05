@@ -2409,7 +2409,7 @@ class BotManager:
                     if not state.acc.get("resume_hash"):
                         continue
                     info = fetch_negotiations_today_count(state.acc, force=True)
-                    if not info:
+                    if not info or info.get('msk_date') != _today_msk():
                         continue
                     count = info.get("today", 0)
                     with state._state_lock:
@@ -2425,17 +2425,20 @@ class BotManager:
                     except Exception as _e:
                         log_debug(f"streak fetch [{state.short}]: {_e}")
                     # Auto-recovery: если стоим в лимит-stop, а реально count < лимит
-                    limit = CONFIG.hh_daily_limit or 200
-                    if (state.hard_stopped or state.paused_reason == "limit") and count < limit - 5:
+                    limit = _effective_daily_ceiling()
+                    if (state.hard_stopped or state.paused_reason == "limit") and max(count, state.daily_sent) < limit - 5:
                         # 5-вакансиевый запас на гонку с in-flight откликами
                         with state._state_lock:
+                            if state._deleted or max(count, state.daily_sent) >= limit - 5:
+                                continue
                             state.hard_stopped = False
                             state.limit_exceeded = False
                             state.limit_reset_time = None
                             if state.paused and state.paused_reason == "limit":
                                 state.paused = False
                                 state.paused_reason = ""
-                            state.daily_sent = count  # sync to truth
+                            # Local confirmed sends may be newer than this HTTP
+                            # snapshot. Never roll them back during recovery.
                         self._add_log(
                             state.short, state.color,
                             f"✅ HH-лимит снят: фактически {count}/{limit} откликов сегодня (auto-recovery)",

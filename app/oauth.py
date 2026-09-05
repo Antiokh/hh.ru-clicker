@@ -969,7 +969,9 @@ def fetch_negotiations_today_count(acc: dict, force: bool = False) -> dict:
                 cookie_jar_key=_token_key(acc) or None, timeout=5,
             )
             if r.status_code != 200:
-                break
+                # A failed page is not a complete daily count. In particular,
+                # an error on page zero must never clear the daily-limit pause.
+                return {}
             d = r.json()
             if page == 0:
                 total_found = int(d.get("found", 0) or 0)

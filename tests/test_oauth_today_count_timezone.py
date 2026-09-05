@@ -1,6 +1,7 @@
 from datetime import datetime, timedelta, timezone
 
 from app import oauth
+import pytest
 
 
 class _Response:
@@ -11,6 +12,22 @@ class _Response:
 
     def json(self):
         return self._payload
+
+
+@pytest.mark.parametrize('failed_page', [0, 1])
+def test_failed_page_does_not_report_zero_or_partial_count(monkeypatch, failed_page):
+    monkeypatch.setattr(oauth, '_oauth_headers', lambda acc: {'Authorization': 'test'})
+    monkeypatch.setattr(oauth, '_negotiations_count_cache', {})
+    def get(*args, **kwargs):
+        response = _Response({'found': 200, 'items': [
+            {'created_at': datetime.now(timezone.utc).isoformat()}
+        ]})
+        if kwargs['params']['page'] == failed_page:
+            response.status_code = 503
+        return response
+    monkeypatch.setattr(oauth.HH, 'get', get)
+    assert oauth.fetch_negotiations_today_count({'resume_hash': 'test'}) == {}
+    assert not oauth._negotiations_count_cache
 
 
 def test_today_count_does_not_count_old_items_when_tzdata_is_unavailable(monkeypatch):
