@@ -241,3 +241,23 @@ def test_questionnaire_no_proxy_direct(hh_no_proxy, monkeypatch):
     _method, _url, kw = rec.calls[0]
     assert "proxy" not in kw
     assert "connector" not in kw
+
+
+@pytest.mark.parametrize('status,body,location,expected', [
+    (302, '', '/account/login', 'auth_error'),
+    (302, '', '/vacancy/777', 'error'),
+    (200, '<html>validation failed</html>', '', 'error'),
+    (200, '<html>"/account/login"</html>', '', 'auth_error'),
+    (200, '{"success":true,"topic_id":"1"}', '', 'sent'),
+    (302, '', '/?withoutTest=no', 'test'),
+])
+def test_questionnaire_requires_confirmed_success(hh_no_proxy, monkeypatch, status, body, location, expected):
+    monkeypatch.setattr(hh_apply.CONFIG, 'llm_fill_questionnaire', False)
+    response = _RecResp(status, body)
+    response.headers = {'location': location}
+    rec = _install_recorder(monkeypatch,
+        get_resp=_RecResp(200, '<textarea name="task_1_text"></textarea>'),
+        post_resp=response)
+    result, _ = _run_coro(hh_apply.fill_and_submit_questionnaire(_make_acc(), '777'))
+    assert result == expected
+    assert [call[0] for call in rec.calls] == ['GET', 'POST']

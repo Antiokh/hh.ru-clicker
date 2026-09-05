@@ -468,6 +468,9 @@ async def fill_and_submit_questionnaire(acc: dict, vid: str,
 
             log_debug(f"Questionnaire submit {vid}: HTTP {status} location={location}")
 
+            if status in (401, 403) or _is_login_page(txt) or '/account/login' in location:
+                return 'auth_error', {}
+
             if status in (302, 303):
                 if "negotiations-limit-exceeded" in location or "negotiations-limit-exceeded" in txt:
                     return "limit", {}
@@ -475,14 +478,19 @@ async def fill_and_submit_questionnaire(acc: dict, vid: str,
                 if "withoutTest=no" in location or f"vacancyId={vid}" in location:
                     log_debug(f"Questionnaire {vid}: form rejected, redirect back")
                     return "test", {}
-                return "sent", {}
+                return "error", {"error_code": "submission_unconfirmed"}
 
             if status == 200:
                 if "negotiations-limit-exceeded" in txt:
                     return "limit", {}
                 if "test-required" in txt:
                     return "test", {}
-                return "sent", {}
+                # HTML 200 can be a validation error or captcha. Only explicit
+                # structured success is sufficient to update application counts.
+                result, info = classify_apply_response(status, txt)
+                if result == 'sent' and txt.lstrip().startswith('{'):
+                    return result, info
+                return "error", {"error_code": "submission_unconfirmed"}
 
             return "test", {}
 

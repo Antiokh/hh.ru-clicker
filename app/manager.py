@@ -130,6 +130,17 @@ def _effective_daily_ceiling() -> int:
     return min(limits) if limits else 200
 
 
+def _cap_apply_batch(batch, daily_sent, hh_today_applies):
+    remaining = max(0, _effective_daily_ceiling() - max(
+        daily_sent or 0, hh_today_applies or 0))
+    return batch[:remaining]
+
+
+def _completed_apply_results(batch, results):
+    return sorted(zip(batch, results), key=lambda item: not (
+        isinstance(item[1], tuple) and item[1][0] in ('sent', 'already')))
+
+
 def _protect_fresh_batch(batch: list, vacancy_meta: dict, *, hours: int,
                          ceiling: int, reserve: int, used: int,
                          now: datetime | None = None) -> tuple[list, int]:
@@ -289,6 +300,7 @@ class BotManager:
         self._hr_contacts_lock = threading.Lock()
         # Guards activate_session against concurrent WS calls spawning duplicate workers
         self._activate_lock = threading.Lock()
+        self._retiring_sessions = []  # (session object, state), until workers exit
         # Сериализация append к data/llm_log.jsonl (kimi-search-1 #5).
         self._llm_log_write_lock = threading.Lock()
 
@@ -354,6 +366,12 @@ class BotManager:
             if temp_idx < 0 or temp_idx >= len(self.temp_sessions):
                 return False
             ts = self.temp_sessions[temp_idx]
+            self._retiring_sessions[:] = [
+                (session, old) for session, old in self._retiring_sessions
+                if any(t.is_alive() for t in getattr(old, '_workers', []))
+            ]
+            if any(session is ts for session, old in self._retiring_sessions):
+                return False
             if not ts.get("resume_hash"):
                 return False
             if temp_idx in self.temp_states:
@@ -400,8 +418,6 @@ class BotManager:
         log_debug(f"activate_session({temp_idx}): starting threads...")
         t1 = threading.Thread(target=self._run_account_worker, args=(900 + temp_idx, state), daemon=True, name=f"worker-{temp_idx}")
         t2 = threading.Thread(target=self._fetch_hh_stats_worker, args=(900 + temp_idx, state), daemon=True, name=f"stats-{temp_idx}")
-        t1.start()
-        t2.start()
         # Store handles + attach на state — stop()/deactivate join'ит их (round-1 #6/#19).
         # Round-2 #4: чистим is_alive() перед extend, чтобы список dead thread'ов
         # не рос навсегда.
@@ -409,12 +425,18 @@ class BotManager:
         # параллельных activate могли перезаписать список друг друга.
         state._workers = [t1, t2]
         with self._activate_lock:
+            if state._deleted:
+                return False
+            t1.start()
+            t2.start()
             if not hasattr(self, "_temp_workers"):
                 self._temp_workers = []
             self._temp_workers[:] = [t for t in self._temp_workers if t.is_alive()]
             self._temp_workers.extend([t1, t2])
         try:
-            self._start_ws_push(state)
+            with self._activate_lock:
+                if not state._deleted:
+                    self._start_ws_push(state)
         except Exception as e:
             log_debug(f"_start_ws_push temp({temp_idx}): {e}")
         log_debug(f"activate_session({temp_idx}): threads started t1={t1.is_alive()} t2={t2.is_alive()}")
@@ -432,10 +454,12 @@ class BotManager:
             ts = self.temp_sessions[temp_idx]
             state = self.temp_states.pop(temp_idx, None)
             if state is not None:
+                self._retiring_sessions.append((ts, state))
                 # Сигналим воркерам: проверки `state._deleted` в каждом цикле
                 # и в pause-loop приведут к graceful exit потоков.
                 state._deleted = True
                 state.paused = True
+                state.paused_reason = 'manual'
             ts["bot_active"] = False
             ts["paused"] = True
         # Аудит 2026-08-17 #19: раньше deactivate возвращался мгновенно, а
@@ -444,6 +468,9 @@ class BotManager:
         # старых, чтобы reactivate шёл на чистом slot'е. Join вне _activate_lock
         # т.к. worker сам берёт lock через save_browser_sessions/etc.
         if state is not None:
+            ws = getattr(state, '_ws_client', None)
+            if ws is not None:
+                ws.stop()
             for t in getattr(state, "_workers", []):
                 try:
                     t.join(timeout=5)
@@ -483,6 +510,8 @@ class BotManager:
         _self = self
 
         def _on_event(event_name: str, payload: dict) -> None:
+            if state._deleted or _self._stop_event.is_set():
+                return
             if event_name == "chat_message_create":
                 import time as _t
                 now = _t.time()
@@ -1908,7 +1937,11 @@ class BotManager:
                         or state.limit_exceeded or getattr(state, "_deleted", False)):
                     break
 
-                batch = filtered[i: i + batch_size]
+                self._maybe_roll_daily_counter(state)
+                batch = _cap_apply_batch(filtered[i: i + batch_size],
+                                         state.daily_sent, state.hh_today_applies)
+                if not batch:
+                    break
                 state.current_vacancy_idx = i + 1
                 state.status_detail = (
                     f"{i + 1}-{min(i + batch_size, len(filtered))}/{state.total_vacancies}"
@@ -1989,7 +2022,7 @@ class BotManager:
                 if state.safety_enabled:
                     checked_batch = []
                     for vid in batch:
-                        if state.paused or getattr(state, "_deleted", False):
+                        if self.paused or self._stop_event.is_set() or state.paused or getattr(state, "_deleted", False):
                             break
                         precheck = get_client(acc).check_vacancy_before_apply(vid)
                         if not precheck["ok"]:
@@ -2045,11 +2078,13 @@ class BotManager:
 
                 # Choose apply method: OAuth API or Web (per-account or global).
                 # Также форс-OAuth в degraded mode (cookies dead, токен живой).
+                if self.paused or self._stop_event.is_set() or state.paused or state._deleted:
+                    break
                 if state.use_oauth or CONFIG.use_oauth_apply or state.degraded_mode:
                     # OAuth: synchronous, one by one (API doesn't support batch)
                     results = []
                     for vid in batch:
-                        if state.paused or getattr(state, "_deleted", False):
+                        if self.paused or self._stop_event.is_set() or state.paused or getattr(state, "_deleted", False):
                             break
                         try:
                             result = _oauth_apply(acc, vid, acc.get("letter", ""))
@@ -2070,11 +2105,12 @@ class BotManager:
                         return send_batch
                     results = asyncio.run(_make_send_batch(batch)())
 
-                for j, (vid, result_data) in enumerate(zip(batch, results)):
-                    # Если auto-pause сработал на предыдущей итерации —
-                    # не продолжаем отправлять оставшиеся вакансии (swarm-12 #10).
-                    if state.paused or state.hard_stopped or getattr(state, "_deleted", False):
-                        break
+                # Persist confirmed successes first, even if stop/limit arrives
+                # while requests are in flight. Error handling below may break.
+                completed = _completed_apply_results(batch, results)
+                for j, (vid, result_data) in enumerate(completed):
+                    # A pause cancels future sends, never accounting for replies
+                    # already received from HH.
                     # Любая итерация — это попытка отклика. Запоминаем время,
                     # чтобы UI мог показать «бот живой, последний раз пробовал
                     # 30с назад» даже когда удачных откликов давно не было.
@@ -2141,6 +2177,9 @@ class BotManager:
                                             salary if salary else "")
 
                     elif result == "test":
+                        if (self.paused or self._stop_event.is_set() or state.paused
+                                or state.hard_stopped or state._deleted):
+                            continue
                         title = info.get("title", "")
                         company = info.get("company", "")
                         display_title = title[:40] if title else vid
@@ -2200,6 +2239,19 @@ class BotManager:
                                 )
                                 self._add_acc_event(state, "⚠️", "error", "Авторизация", "", "Обновите куки")
                                 break
+                            elif q_result == 'error':
+                                # A transport/confirmation error does not mean
+                                # the applicant failed the employer's test.
+                                reason = q_info.get('error_code') or q_info.get('exception') or 'HTTP error'
+                                state.errors += 1
+                                state.paused = True
+                                state.paused_reason = 'manual'
+                                self._add_response(state, vid, title, company, 'error')
+                                self._add_log(state.short, state.color,
+                                              f'Анкета: результат не подтверждён ({reason}). Пауза: проверьте отклик в HH перед продолжением.', 'warning')
+                                # Hold ambiguous submissions for manual review;
+                                # never blindly resend a potentially accepted form.
+                                add_test_vacancy(vid, title, company, acc['name'], acc.get('resume_hash', ''))
                             else:
                                 # Не удалось — считаем неудачи
                                 state._test_failures[vid] = state._test_failures.get(vid, 0) + 1

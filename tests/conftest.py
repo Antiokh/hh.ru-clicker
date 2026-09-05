@@ -9,6 +9,12 @@ sys.path.insert(0, str(ROOT))
 
 import pytest
 
+# Install before test collection imports app singletons or creates log handlers.
+import logging
+from app import logging_utils as _test_logging
+_test_logging._logger = logging.getLogger('hh_bot_tests')
+_test_logging._logger.addHandler(logging.NullHandler())
+
 
 @pytest.fixture(autouse=True)
 def tmp_data_dir(tmp_path, monkeypatch):
