@@ -8,7 +8,7 @@ from datetime import datetime, timedelta
 from collections import deque
 
 from app.config import CONFIG
-from app.storage import _cache_applied, _cache_lock
+from app.storage import count_applied_on_day
 
 
 class AccountState:
@@ -67,12 +67,7 @@ class AccountState:
         # Count today's applies from persisted cache
         self.daily_sent = 0
         try:
-            with _cache_lock:
-                acc_applied = (_cache_applied or {}).get(self.name, {})
-                today = self.daily_date
-                for vid, info in acc_applied.items():
-                    if isinstance(info, dict) and str(info.get("at", "")).startswith(today):
-                        self.daily_sent += 1
+            self.daily_sent = count_applied_on_day(self.name, self.daily_date)
         except Exception:
             pass
         self.hard_stopped = False  # жёсткая остановка (лимит или daily)

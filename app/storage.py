@@ -536,7 +536,28 @@ def _restrict_perms(path):
         pass
 
 
-def add_applied(account_name: str, vacancy_id: str, info: dict = None):
+def count_applied_on_day(account_name: str, day: str) -> int:
+    """Count persisted applications by Moscow day, including legacy local dates."""
+    from zoneinfo import ZoneInfo
+    zone = ZoneInfo('Europe/Moscow')
+    _load_cache()
+    with _cache_lock:
+        records = list((_cache_applied or {}).get(account_name, {}).values())
+    count = 0
+    for record in records:
+        if not isinstance(record, dict):
+            continue
+        try:
+            stamp = datetime.fromisoformat(str(record.get('at', '')))
+            # Historical naive timestamps were written in the server's local TZ.
+            if stamp.astimezone(zone).date().isoformat() == day:
+                count += 1
+        except (ValueError, TypeError, OverflowError):
+            continue
+    return count
+
+
+def add_applied(account_name: str, vacancy_id: str, info: dict = None, *, confirmed: bool = True):
     global _applied_dirty, _applied_mut_seq
     _load_cache()
     with _cache_lock:
@@ -555,7 +576,8 @@ def add_applied(account_name: str, vacancy_id: str, info: dict = None):
             "company": company,
             "salary_from": new_info.get("salary_from") or existing.get("salary_from"),
             "salary_to": new_info.get("salary_to") or existing.get("salary_to"),
-            "at": datetime.now().isoformat()
+            # Discovering an existing application does not date it to today.
+            "at": existing.get('at') or (datetime.now().astimezone().isoformat() if confirmed else '')
         }
         total = sum(len(v) for v in _cache_applied.values())
         if total > _APPLIED_MAX:

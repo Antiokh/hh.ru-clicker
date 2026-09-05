@@ -2270,7 +2270,7 @@ class BotManager:
                     elif result == "already":
                         state.already_applied += 1
                         already_info = state.vacancy_meta.get(vid, {})
-                        add_applied(acc["name"], vid, already_info if already_info else None)
+                        add_applied(acc["name"], vid, already_info if already_info else None, confirmed=False)
                         self._push_action(state, f"\U0001f504 {vid}")
                         self._add_response(state, vid, "", "", "already")
 
