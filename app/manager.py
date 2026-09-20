@@ -4231,7 +4231,7 @@ class BotManager:
                                 or _event.get("eventType")
                                 or _event.get("type")
                             )
-                        _client = get_client({**state.acc, "_mutation_guard": lambda: self._can_mutate(state, llm=True)})
+                        _client = get_client({**state.acc, "_message_trigger_id": str(last_msg_id), "_mutation_guard": lambda: self._can_mutate(state, llm=True)})
                         # Settings can change while the picker is running.
                         if not self._can_mutate(state, llm=True):
                             with self._llm_sent_lock:
@@ -4427,7 +4427,7 @@ class BotManager:
                             pass
                         continue
                     log_debug(f"LLM [{state.short}] {neg_id}: отправляю сообщение в chatik")
-                    sender = get_client({**state.acc, "_mutation_guard": lambda: self._can_mutate(state, llm=True)})
+                    sender = get_client({**state.acc, "_message_trigger_id": str(last_msg_id), "_mutation_guard": lambda: self._can_mutate(state, llm=True)})
                     if not self._can_mutate(state, llm=True):
                         with self._llm_sent_lock:
                             self._llm_sent_global.discard(global_key)

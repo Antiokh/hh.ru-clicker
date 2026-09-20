@@ -49,7 +49,9 @@ def send_message(acc: dict, chat_id: str, text: str,
         log_debug(f"mobile send_message chat={chat_id}: HTTP {e.status_code} | {e.payload}")
         return False
     # 2xx: опционально парсим response["message"] (SentMessageNetwork).
-    message = data.get("message") if isinstance(data, dict) else None
+    message = data.get("message", data) if isinstance(data, dict) else None
     msg_id = message.get("id") if isinstance(message, dict) else None
+    if isinstance(msg_id, bool) or not isinstance(msg_id, (str, int)) or not str(msg_id).strip():
+        raise MobileAPIError(200, payload='missing_message_receipt', outcome_unknown=True)
     log_debug(f"mobile send_message chat={chat_id}: ok, message_id={msg_id}")
     return True

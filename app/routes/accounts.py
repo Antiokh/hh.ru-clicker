@@ -60,6 +60,12 @@ async def api_account_active_resume(idx: int, request: Request):
     allowed = {str(r.get("hash") or "") for r in persistent.get("all_resumes") or [] if isinstance(r, dict)}
     if not resume_hash or resume_hash not in allowed:
         return {"ok": False, "error": "Резюме не принадлежит аккаунту"}
+    try:
+        from app import message_quarantine, apply_quarantine
+        message_quarantine.bind_account(acc)
+        apply_quarantine.bind_account(acc)
+    except (ValueError, OSError):
+        return {"ok": False, "error": "Не удалось сохранить защитные блокировки перед сменой резюме"}
     persistent["resume_hash"] = resume_hash
     acc["resume_hash"] = resume_hash
     saver()

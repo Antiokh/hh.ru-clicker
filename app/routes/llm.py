@@ -17,6 +17,44 @@ from app.llm import _openclaw_command
 router = APIRouter()
 
 
+@router.get('/api/llm/quarantine')
+async def api_llm_quarantine():
+    from app.message_quarantine import records
+    items = []
+    states = list(bot.account_states) + list(bot.temp_states.values())
+    try:
+        for idx, state in enumerate(states):
+            for chat_id, record in records(state.acc).items():
+                if record.get('reason') != 'confirmed':
+                    items.append({'chat_id': chat_id, 'account': state.short, 'idx': idx,
+                                  'can_review': bool(record.get('has_trigger')), 'fingerprint': record.get('fingerprint'),
+                                  'recorded_at': record.get('recorded_at'),
+                                  'reason': 'Результат отправки не подтверждён; повтор запрещён'})
+    except Exception:
+        return {'ok': False, 'error': 'Хранилище блокировок недоступно. Отправка сообщений защищена от повтора.'}
+    return {'ok': True, 'items': items}
+
+
+@router.post('/api/llm/quarantine/review')
+async def api_llm_quarantine_review(request: Request):
+    from app.message_quarantine import acknowledge
+    try:
+        body = await request.json()
+    except (ValueError, TypeError):
+        return {'ok': False, 'error': 'Некорректный JSON'}
+    if not isinstance(body, dict):
+        return {'ok': False, 'error': 'Ожидается JSON-объект'}
+    states = list(bot.account_states) + list(bot.temp_states.values())
+    idx = body.get('idx')
+    if type(idx) is not int or not 0 <= idx < len(states) or body.get('confirmed') is not True:
+        return {'ok': False, 'error': 'Нужно явно подтвердить ручную проверку чата'}
+    try:
+        acknowledge(states[idx].acc, str(body.get('chat_id') or ''), body.get('fingerprint'))
+    except (ValueError, OSError):
+        return {'ok': False, 'error': 'Не удалось безопасно снять блокировку. Обновите список.'}
+    return {'ok': True}
+
+
 def _llm_proxies():
     """proxies-dict для requests к LLM-провайдеру, если задан env LLM_PROXY.
 

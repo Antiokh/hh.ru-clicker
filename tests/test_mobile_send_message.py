@@ -33,7 +33,7 @@ def test_201_also_returns_true(monkeypatch):
 @responses.activate
 def test_idempotency_key_generated_when_empty(monkeypatch):
     monkeypatch.setattr(oauth, "_obtain_oauth_token", lambda a: "t")
-    responses.add(responses.POST, URL, json={"message": {}}, status=200)
+    responses.add(responses.POST, URL, json={"message": {"id": "synthetic-message"}}, status=200)
     send_message(ACC, "777", "hi")
     sent = json.loads(responses.calls[0].request.body)
     key = sent["idempotency_key"]
@@ -44,7 +44,7 @@ def test_idempotency_key_generated_when_empty(monkeypatch):
 @responses.activate
 def test_explicit_idempotency_key_used_verbatim(monkeypatch):
     monkeypatch.setattr(oauth, "_obtain_oauth_token", lambda a: "t")
-    responses.add(responses.POST, URL, json={"message": {}}, status=200)
+    responses.add(responses.POST, URL, json={"message": {"id": "synthetic-message"}}, status=200)
     send_message(ACC, "777", "hi", idempotency_key="my-key-123")
     sent = json.loads(responses.calls[0].request.body)
     assert sent["idempotency_key"] == "my-key-123"

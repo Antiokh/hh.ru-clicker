@@ -1772,6 +1772,7 @@ function _renderEmpRatingSlots(vid, data) {
 }
 
 async function llmInterviewsLoad() {
+  llmQuarantineLoad();
   if (_llmLoading) return;   // уже идёт запрос — не запускаем параллельный
   _llmLoading = true;
   const acc = document.getElementById('llm-log-acc-filter')?.value || '';
@@ -1794,6 +1795,35 @@ async function llmInterviewsLoad() {
   // каждой перезагрузке interviews. Отдельный рендер, чтобы фильтры/сортировка
   // основной таблицы не перезаписывали блок ссылок.
   _llmRenderHrLinks(_llmRowsCache);
+}
+
+async function llmQuarantineLoad() {
+  const el = document.getElementById('llm-quarantine');
+  if (!el) return;
+  try {
+    const response = await fetch('/api/llm/quarantine');
+    if (!response.ok) throw new Error('request failed');
+    const data = await response.json();
+    if (!data.ok) throw new Error('storage unavailable');
+    el.innerHTML = data.items.length ? '<b>Чаты, требующие проверки</b>' + data.items.map(item =>
+      `<div style="margin-top:8px">${esc(item.account)} · ${esc(item.recorded_at || '')}<br>${esc(item.reason)} · <a href="https://hh.ru/chat/${encodeURIComponent(item.chat_id)}" target="_blank" rel="noopener noreferrer">Проверить в HH ↗</a>${item.can_review ? ` <button class="btn-sm" onclick="${esc(`llmQuarantineReview(${JSON.stringify(item)})`)}">Проверил — разрешить новые ответы</button>` : '<br>Старая запись без ID входящего сообщения: безопасное снятие через интерфейс недоступно.'}</div>`
+    ).join('') + '<div style="margin-top:8px">Другие чаты и отклики работают. Автоматическая повторная отправка в эти чаты запрещена.</div>' : 'Нет изолированных чатов.';
+  } catch(e) {
+    el.textContent = 'Не удалось загрузить блокировки чатов. Обновите страницу; это не означает, что блокировок нет.';
+  }
+}
+
+async function llmQuarantineReview(item) {
+  if (!confirm('Вы проверили чат в HH? Старый ответ повторяться не будет. Разрешить ответы только на новые сообщения HR?')) return;
+  try {
+    const response = await fetch('/api/llm/quarantine/review', {
+      method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({idx: item.idx, chat_id: item.chat_id, fingerprint: item.fingerprint, confirmed: true})
+    });
+    const data = await response.json();
+    if (!response.ok || !data.ok) throw new Error(data.error || 'Ошибка сохранения');
+    await llmQuarantineLoad();
+  } catch(e) { alert(e.message || 'Не удалось сохранить проверку'); }
 }
 
 function llmInterviewsRender() {

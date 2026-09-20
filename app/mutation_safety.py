@@ -1,6 +1,7 @@
 """Runtime-only cancellation checks for account mutations (never serialized)."""
 from functools import wraps
 import inspect
+from contextlib import nullcontext
 
 
 class MutationBlocked(RuntimeError):
@@ -25,23 +26,29 @@ def ensure_mutation_allowed(acc):
 
 
 def guarded_method(method, acc):
-    def check_chat(args, kwargs):
+    def chat_attempt(args, kwargs):
         if method.__name__ in ('send_message', 'send_workflow_event'):
-            from app.message_quarantine import blocked
+            from app.message_quarantine import attempt
             chat_id = args[0] if args else kwargs.get('neg_id', kwargs.get('chat_id'))
-            if blocked(acc, chat_id):
-                raise MutationBlocked('Чат изолирован: результат предыдущего сообщения неизвестен')
+            return attempt(acc, chat_id, method.__name__, args, kwargs)
+        return nullcontext({})
 
     if inspect.iscoroutinefunction(method):
         @wraps(method)
         async def run(*args, **kwargs):
             ensure_mutation_allowed(acc)
-            check_chat(args, kwargs)
-            return await method(*args, **kwargs)
+            with chat_attempt(args, kwargs) as outcome:
+                ensure_mutation_allowed(acc)
+                result = await method(*args, **kwargs)
+                outcome['confirmed'] = result is True
+                return result
     else:
         @wraps(method)
         def run(*args, **kwargs):
             ensure_mutation_allowed(acc)
-            check_chat(args, kwargs)
-            return method(*args, **kwargs)
+            with chat_attempt(args, kwargs) as outcome:
+                ensure_mutation_allowed(acc)
+                result = method(*args, **kwargs)
+                outcome['confirmed'] = result is True
+                return result
     return run

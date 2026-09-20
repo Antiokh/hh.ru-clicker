@@ -61,6 +61,14 @@ def test_corruption_blocks_dispatch():
     assert quarantine.blocked({'user_id': 'owner-a'}, 'vacancy-a')
 
 
+def test_resume_alias_and_nested_corruption():
+    quarantine.retain({'resume_hash': 'resume-a'}, {'vacancy_id': 'vacancy-a'})
+    assert quarantine.blocked({'resume_hash': 'resume-a', 'user_id': 'owner-a'}, 'vacancy-a')
+    assert quarantine.blocked({'resume_hash': 'resume-b', 'user_id': 'owner-a'}, 'vacancy-a')
+    quarantine.PATH.write_text('{"owner-a": []}')
+    assert quarantine.blocked({'user_id': 'owner-a'}, 'vacancy-a')
+
+
 def test_mobile_dispatch_does_not_contact_hh(setup, monkeypatch):
     from app import mobile_apply
     bot, state, _ = setup
