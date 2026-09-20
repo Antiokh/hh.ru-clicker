@@ -1,6 +1,21 @@
 from types import SimpleNamespace
 
+import pytest
+
 from app.manager import BotManager, _mobile_search_filters, _uses_api_search, parse_search_url
+
+
+@pytest.fixture(autouse=True)
+def reset_search_filter_config(monkeypatch):
+    """Keep tests independent of other modules' changes to global CONFIG."""
+    for key, value in {
+        "fresh_vacancies_mode": False,
+        "search_period_days": 0,
+        "filter_agencies": False,
+        "filter_low_competition": False,
+        "prefer_hh_signals": False,
+    }.items():
+        monkeypatch.setattr("app.manager.CONFIG." + key, value)
 
 
 def test_mobile_fresh_mode_requests_server_publication_order(monkeypatch):
@@ -12,6 +27,43 @@ def test_mobile_fresh_mode_requests_server_publication_order(monkeypatch):
         "order_by": "publication_time",
         "period": 3,
     }
+
+
+def test_signal_mode_requests_optional_skill_data(monkeypatch):
+    monkeypatch.setattr("app.manager.CONFIG.prefer_hh_signals", True)
+    assert _mobile_search_filters({})["with_skills_match"] == "true"
+
+
+def test_collector_preserves_safe_signals_and_comparable_salary(monkeypatch):
+    url = "https://hh.ru/search/vacancy?text=python"
+    state = SimpleNamespace(acc={"urls": [url]}, _deleted=False, short="S",
+                            status_detail="", vacancy_meta={})
+    items = [{
+        "id": "synthetic", "manager_activity": {"is_online_until": "2099-01-01T00:00:00Z"},
+        "skills_match": {"match_by_skills_statistics": {"match_percentage": 85}},
+        "relations": ["got_response", "arbitrary"],
+        "salary_range": {"currency": "RUR", "mode": {"id": "MONTH"}, "from": 120000},
+    }]
+    monkeypatch.setattr("app.manager.get_client", lambda acc: SimpleNamespace(
+        search_vacancies=lambda *args, **kwargs: items))
+    bot = BotManager.__new__(BotManager)
+    _, salary, _ = bot._collect_via_oauth_api(state)
+    meta = state.vacancy_meta["synthetic"]
+    assert meta["skills_match_percent"] == 85
+    assert meta["manager_activity"]["is_online_until"].startswith("2099-")
+    assert meta["relations"] == ["got_response"]
+    assert salary == {"synthetic": 120000}
+    # Optional-signal rejection / missing data must not leave an old score alive.
+    items[:] = [{"id": "synthetic", "salary": {"from": 4000, "currency": "USD"}}]
+    _, salary, _ = bot._collect_via_oauth_api(state)
+    assert "skills_match_percent" not in meta
+    assert meta["manager_activity"] == {}
+    assert salary == {"synthetic": None}
+
+
+def test_no_magic_preserved_as_search_semantics():
+    _, _, filters = parse_search_url("https://hh.ru/search/vacancy?no_magic=true")
+    assert filters == {"no_magic": "true"}
 
 
 def test_mobile_search_keeps_explicit_order_and_omits_unsupported_period(monkeypatch):
@@ -34,14 +86,87 @@ def test_parse_search_url_preserves_resume_and_multivalue_filters():
     assert filters == {"resume": "r1", "professional_role": ["1", "2"]}
 
 
-def test_parse_search_url_defaults_to_all_russia():
+def test_parse_search_url_without_area_does_not_restrict_country():
     text, area, filters = parse_search_url(
         "https://hh.ru/search/vacancy?resume=r1&order_by=publication_time"
     )
 
     assert text == ""
-    assert area == 113
+    assert area is None
     assert filters == {"resume": "r1", "order_by": "publication_time"}
+
+
+def test_parse_search_url_preserves_all_selected_regions():
+    text, area, filters = parse_search_url(
+        "https://hh.ru/search/vacancy?text=python&area=1&area=2"
+        "&professional_role=10&professional_role=20"
+    )
+
+    assert text == "python"
+    assert area == ["1", "2"]
+    assert filters == {"professional_role": ["10", "20"]}
+
+
+@pytest.mark.parametrize("agencies,competition,expected", [
+    (True, False, ["not_from_agency"]),
+    (False, True, ["low_performance"]),
+    (True, True, ["not_from_agency", "low_performance"]),
+])
+def test_mobile_search_honors_each_smart_filter(
+    monkeypatch, agencies, competition, expected,
+):
+    monkeypatch.setattr("app.manager.CONFIG.filter_agencies", agencies)
+    monkeypatch.setattr("app.manager.CONFIG.filter_low_competition", competition)
+
+    result = _mobile_search_filters({})
+
+    labels = result["label"]
+    assert (labels if isinstance(labels, list) else [labels]) == expected
+
+
+@pytest.mark.parametrize("labels,expected", [
+    ("with_address", ["with_address", "not_from_agency", "low_performance"]),
+    (["low_performance", "with_address"],
+     ["low_performance", "with_address", "not_from_agency"]),
+    (["not_from_agency", "low_performance"],
+     ["not_from_agency", "low_performance"]),
+])
+def test_mobile_search_merges_labels_without_mutating_url_filters(
+    monkeypatch, labels, expected,
+):
+    monkeypatch.setattr("app.manager.CONFIG.filter_agencies", True)
+    monkeypatch.setattr("app.manager.CONFIG.filter_low_competition", True)
+    original = list(labels) if isinstance(labels, list) else labels
+    filters = {"label": labels, "experience": "between1And3"}
+
+    result = _mobile_search_filters(filters)
+
+    assert result == {"label": expected, "experience": "between1And3"}
+    assert filters == {"label": original, "experience": "between1And3"}
+
+
+def test_api_collector_passes_all_regions_and_enabled_labels(monkeypatch):
+    url = "https://hh.ru/search/vacancy?text=python&area=1&area=2&label=with_address"
+    state = SimpleNamespace(
+        acc={"mode": "mobile", "urls": [url]}, _deleted=False,
+        short="synthetic", status_detail="", vacancy_meta={},
+    )
+    calls = []
+    client = SimpleNamespace(
+        search_vacancies=lambda *args, **kwargs: calls.append((args, kwargs)) or []
+    )
+    monkeypatch.setattr("app.manager.get_client", lambda account: client)
+    monkeypatch.setattr("app.manager.CONFIG.pages_per_url", 1)
+    monkeypatch.setattr("app.manager.CONFIG.filter_agencies", True)
+    monkeypatch.setattr("app.manager.CONFIG.filter_low_competition", True)
+
+    BotManager.__new__(BotManager)._collect_via_oauth_api(state)
+
+    assert len(calls) == 1
+    assert calls[0][1]["area_id"] == ["1", "2"]
+    assert calls[0][1]["filters"]["label"] == [
+        "with_address", "not_from_agency", "low_performance",
+    ]
 
 
 def test_mobile_resume_search_uses_apk_native_api_with_live_cookies():

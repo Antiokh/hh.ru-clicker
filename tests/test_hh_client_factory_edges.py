@@ -73,8 +73,10 @@ def test_oauth_questionnaire_uses_ephemeral_autologin(monkeypatch):
     async def fake_web_account(acc):
         return {**acc, "cookies": {"hhtoken": "ephemeral", "_xsrf": "csrf"}}
 
-    async def fake_submit(acc, *args):
+    async def fake_submit(acc, *args, receipt_account=None):
         assert acc["cookies"]["hhtoken"] == "ephemeral"
+        assert receipt_account is client.acc
+        assert receipt_account is not acc
         return "sent", {}
 
     monkeypatch.setattr(mobile_questionnaire, "oauth_web_account", fake_web_account)

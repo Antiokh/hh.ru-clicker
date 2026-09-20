@@ -89,7 +89,7 @@ def test_manual_parser_keeps_radio_labels_checkbox_and_select(monkeypatch):
 def test_submit_encodes_checkbox_as_repeated_fields(monkeypatch):
     captured = []
     responses = [Response(text="<input type=hidden name=x value=y>"),
-                 Response(status=302, location="/applicant/negotiations")]
+                 Response(status=200, text='{"success":true,"topic_id":"1"}')]
     monkeypatch.setattr(apply_route, "aiohttp", fake_aiohttp(responses, captured))
     acc = {"name": "A", "cookies": {"_xsrf": "x"}, "resume_hash": "rh",
            "letter": "", "mode": "web"}

@@ -77,11 +77,15 @@ def _seconds_until_midnight() -> int:
 
 class MobileAuthError(RuntimeError):
     def __init__(self, message: str, *, status_code: int = 400, retry_after: int | None = None,
-                 captcha_url: str | None = None):
+                 captcha_url: str | None = None, error_kind: str = "other"):
         super().__init__(message)
         self.status_code = status_code
         self.retry_after = retry_after
         self.captcha_url = captcha_url
+        self.error_kind = error_kind if error_kind in {
+            "auth", "challenge", "rate_limit", "denied", "http_error", "network",
+            "token_unavailable", "invalid_response", "other",
+        } else "other"
 
 
 @dataclass(frozen=True)
@@ -295,15 +299,35 @@ def mask_login(login: str) -> str:
 
 def _safe_error(response: requests.Response) -> MobileAuthError:
     retry = response.headers.get("Retry-After")
-    retry_after = int(retry) if retry and retry.isdigit() else None
+    retry_after = (min(int(retry), 86400) if isinstance(retry, str)
+                   and 0 < len(retry) <= 10 and retry.isascii() and retry.isdigit()
+                   and int(retry) > 0 else None)
     message = "HH отклонил запрос"
     captcha_url = None
+    error_kind = {401: "auth", 403: "denied", 429: "rate_limit"}.get(
+        response.status_code, "http_error")
     try:
         payload = response.json()
         # НЕ логируем payload целиком: ответ HH может содержать телефон/login (PII).
         errors = payload.get("errors", []) if isinstance(payload, dict) else []
+        errors = errors[:20] if isinstance(errors, list) else []
         first = errors[0] if errors and isinstance(errors[0], dict) else {}
         kind, value = first.get("type", ""), first.get("value", "")
+        kind = kind if isinstance(kind, str) else ""
+        value = value if isinstance(value, str) else ""
+        markers = {entry.get(key) for entry in errors if isinstance(entry, dict)
+                   for key in ("type", "value") if isinstance(entry.get(key), str)}
+        # Exact server error codes only; arbitrary response text is not evidence
+        # of an expired/revoked token. Permission/scope denial is not expiry.
+        if response.status_code != 429 and markers.intersection({
+            "invalid_token", "token_revoked", "token_expired", "expired_token",
+            "bad_token", "invalid_grant",
+        }):
+            error_kind = "auth"
+        elif error_kind not in {"auth", "rate_limit"} and any(
+                "captcha" in marker.lower() or marker == "challenge_required"
+                for marker in markers):
+            error_kind = "challenge"
         if value == "confirmation_code_expired":
             message = "Код подтверждения истёк. Запросите новый код."
         elif kind == "bad_argument" and value == "confirmation_code":
@@ -322,7 +346,7 @@ def _safe_error(response: requests.Response) -> MobileAuthError:
         pass
     return MobileAuthError(
         message, status_code=response.status_code, retry_after=retry_after,
-        captcha_url=captcha_url,
+        captcha_url=captcha_url, error_kind=error_kind,
     )
 
 
@@ -345,25 +369,22 @@ class HHMobileClient:
     def __init__(self, config: MobileConfig | None = None, session: requests.Session | None = None):
         self.config = config or effective_config()[0]
         self.session = session or requests.Session()
-        # Единый egress: мобильный OTP/API-трафик тоже идёт через HH_PROXY, если он
-        # задан (иначе сервер светится hh.ru с двух IP — реального и прокси).
-        # requests[socks] поддерживает socks5h через PySocks.
-        # Fail-closed: если прокси задан, но механизм egress сломан/недоступен —
-        # падаем с ошибкой, а НЕ молча идём напрямую (раньше любой внутренний сбой
-        # превращался в прямой egress в обход заданной защиты).
+        self._egress_kwargs()
+
+    def _egress_kwargs(self) -> dict:
+        """Use the explicit runtime choice, or an injected check's pinned choice."""
         try:
-            from app.hh_http import egress_proxy
-            _proxy = egress_proxy()
+            from app.hh_http import PinnedEgressSession, snapshot_egress_proxies
+            proxies = (dict(self.session._egress_snapshot)
+                       if isinstance(self.session, PinnedEgressSession)
+                       else snapshot_egress_proxies())
         except Exception as exc:
-            if os.environ.get("HH_PROXY", "").strip():
-                raise MobileAuthError(
-                    "HH_PROXY задан, но egress-прокси не удалось применить — прямой выход запрещён",
-                    status_code=503,
-                ) from exc
-            # HH_PROXY не задан — легитимный режим работы без прокси.
-            _proxy = ""
-        if _proxy and not self.session.proxies:
-            self.session.proxies = {"http": _proxy, "https": _proxy}
+            raise MobileAuthError("Не удалось проверить настройки подключения HH",
+                                  status_code=503) from exc
+        self.session.trust_env = False
+        # Explicit direct must discard old session-level proxies too.
+        self.session.proxies = dict(proxies)
+        return {"proxies": dict(proxies)}
 
     def _request(self, method: str, path: str, *, token: str = "", data=None, params=None) -> Any:
         headers = {"Accept": "application/json", "User-Agent": self.config.user_agent}
@@ -374,34 +395,21 @@ class HHMobileClient:
                 "Authorization": f"Bearer {self.config.app_client_token}",
                 "X-Force-App-Access": "true",
             })
-        # Per-request прокси: egress читается в момент запроса, а не один раз в
-        # __init__, чтобы runtime-смена HH_PROXY через app.hh_http.set_proxy()
-        # подхватывалась долгоживущими клиентами без пересоздания. Когда прокси
-        # не задан — kwarg не передаём вовсе: session.proxies из __init__
-        # продолжает действовать (в т.ч. у injected sessions со своими настройками).
-        try:
-            from app.hh_http import egress_proxies
-            _runtime_proxies = egress_proxies()
-        except Exception:
-            # Конфиг egress недоступен — остаёмся на session-level прокси из
-            # __init__, где fail-closed проверка уже прошла.
-            _runtime_proxies = None
         kwargs: dict[str, Any] = dict(data=data, params=params, headers=headers, timeout=20)
-        if _runtime_proxies is not None:
-            kwargs["proxies"] = _runtime_proxies
+        kwargs.update(self._egress_kwargs())
         try:
             response = self.session.request(
                 method, self.config.base_url + "/" + path.lstrip("/"),
                 **kwargs,
             )
         except requests.RequestException as exc:
-            raise MobileAuthError("Не удалось соединиться с HH") from exc
+            raise MobileAuthError("Не удалось соединиться с HH", status_code=0, error_kind="network") from exc
         if response.status_code >= 400:
             raise _safe_error(response)
         try:
             return response.json() if response.content else {}
         except ValueError as exc:
-            raise MobileAuthError("HH вернул некорректный JSON") from exc
+            raise MobileAuthError("HH вернул некорректный JSON", error_kind="invalid_response") from exc
 
     def request_code(self, login: str, login_type: str, notification_type: str | None = None) -> dict:
         if login_type not in {"phone", "email"}:
@@ -540,11 +548,11 @@ class HHMobileClient:
         """
         hhid = str(me.get("id") or "").strip()
         if not hhid:
-            raise MobileAuthError("Ответ /me не содержит id для autologin")
+            raise MobileAuthError("Ответ /me не содержит id для autologin", error_kind="invalid_response")
         payload = self._request("GET", f"autologin_key/{quote(hhid, safe='')}", token=token)
         key = payload.get("key") if isinstance(payload, dict) else None
         if not isinstance(key, str) or not key:
-            raise MobileAuthError("HH не вернул ключ autologin")
+            raise MobileAuthError("HH не вернул ключ autologin", error_kind="invalid_response")
 
         url = "https://hh.ru/?" + urlencode({"loginkey": key})
         headers = {"Accept": "text/html,application/xhtml+xml", "User-Agent": self.config.user_agent}
@@ -554,9 +562,10 @@ class HHMobileClient:
             if parsed.scheme != "https" or not (host == "hh.ru" or host.endswith(".hh.ru")):
                 raise MobileAuthError("HH autologin попытался перейти на внешний адрес")
             try:
-                response = self.session.get(url, headers=headers, timeout=20, allow_redirects=False)
+                response = self.session.get(url, headers=headers, timeout=20, allow_redirects=False,
+                                            **self._egress_kwargs())
             except requests.RequestException as exc:
-                raise MobileAuthError("Не удалось открыть штатный HH autologin URL") from exc
+                raise MobileAuthError("Не удалось открыть штатный HH autologin URL", status_code=0, error_kind="network") from exc
             if response.status_code not in {301, 302, 303, 307, 308}:
                 if response.status_code >= 400:
                     raise _safe_error(response)
@@ -577,7 +586,7 @@ class HHMobileClient:
         if me.get("crypted_id") and not cookies.get("crypted_id"):
             cookies["crypted_id"] = str(me["crypted_id"])
         if not cookies.get("hhtoken") or not cookies.get("_xsrf"):
-            raise MobileAuthError("Autologin завершился без обязательных hhtoken/_xsrf cookies")
+            raise MobileAuthError("Autologin завершился без обязательных hhtoken/_xsrf cookies", error_kind="invalid_response")
         return cookies
 
 

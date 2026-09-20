@@ -45,6 +45,46 @@ _IMPERSONATE = os.environ.get("HH_IMPERSONATE", "chrome124")
 # Пример: HH_PROXY=socks5h://warp:1080 (WARP-sidecar контейнер).
 _PROXY = os.environ.get("HH_PROXY", "").strip()
 
+
+def snapshot_egress_proxies() -> dict:
+    """Capture the explicit runtime choice; read failures never mean direct."""
+    value = egress_proxy()
+    if not isinstance(value, str):
+        raise ValueError("HH egress configuration is unavailable")
+    value = value.strip()
+    return {"http": value, "https": value} if value else {}
+
+
+class PinnedEgressSession(_requests.Session):
+    """One check uses one explicit proxy/direct choice, without environment fallback."""
+    def __init__(self):
+        super().__init__()
+        self.trust_env = False
+        self._egress_snapshot = snapshot_egress_proxies()
+
+    def request(self, method, url, **kwargs):
+        self.trust_env = False
+        kwargs["proxies"] = dict(self._egress_snapshot)
+        return super().request(method, url, **kwargs)
+
+    def merge_environment_settings(self, url, proxies, stream, verify, cert):
+        settings = super().merge_environment_settings(url, {}, stream, verify, cert)
+        # Ignore stale or injected session.proxies as well as per-call overrides.
+        settings["proxies"] = dict(self._egress_snapshot)
+        return settings
+
+
+def _new_requests_session():
+    session = _requests.Session()
+    session.trust_env = False
+    return session
+
+
+def _new_cffi_session():
+    if not _HAS_CFFI:
+        return None
+    return _CffiSession(trust_env=False)
+
 _DIAG_PATH = Path("data/diag.log")
 _DIAG_LOCK = threading.Lock()
 _DIAG_MAX_SIZE = 10 * 1024 * 1024  # 10 MB → truncate
@@ -156,8 +196,8 @@ class HHClient:
     _MAX_SESSIONS = 100  # LRU-лимит per-account реестра сессий
 
     def __init__(self):
-        self._session_cffi = _CffiSession() if _HAS_CFFI else None
-        self._session_req = _requests.Session()
+        self._session_cffi = _new_cffi_session()
+        self._session_req = _new_requests_session()
         # Per-account сессии: cookie_jar_key -> {"cffi": ..., "req": ...}.
         # LRU: недавно использованные ключи в конце (move_to_end при доступе).
         self._sessions: OrderedDict[str, dict] = OrderedDict()
@@ -178,8 +218,8 @@ class HHClient:
             entry = self._sessions.get(cookie_jar_key)
             if entry is None:
                 entry = {
-                    "cffi": _CffiSession() if _HAS_CFFI else None,
-                    "req": _requests.Session(),
+                    "cffi": _new_cffi_session(),
+                    "req": _new_requests_session(),
                 }
                 self._sessions[cookie_jar_key] = entry
             self._sessions.move_to_end(cookie_jar_key)
@@ -216,8 +256,8 @@ class HHClient:
             kwargs["headers"] = headers
 
         # Инжектим прокси если задан HH_PROXY и caller не переопределил свой.
-        if _PROXY and "proxies" not in kwargs and "proxy" not in kwargs:
-            kwargs["proxies"] = {"http": _PROXY, "https": _PROXY}
+        if "proxies" not in kwargs and "proxy" not in kwargs:
+            kwargs["proxies"] = snapshot_egress_proxies()
 
         # Per-account сессия (cookie_jar_key) или общая legacy (None).
         sess_cffi, sess_req = self._get_session(cookie_jar_key)
@@ -361,8 +401,8 @@ def set_proxy(url: str) -> str:
     _PROXY = url
     # HH-singleton пересоздаём чтобы sticky-connections не остались от старого прокси.
     try:
-        HH._session_cffi = _CffiSession() if _HAS_CFFI else None
-        HH._session_req = _requests.Session()
+        HH._session_cffi = _new_cffi_session()
+        HH._session_req = _new_requests_session()
     except Exception:
         pass
     # Per-account сессии тоже привязаны к старому прокси — очищаем реестр;

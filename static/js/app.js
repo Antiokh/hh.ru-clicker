@@ -185,7 +185,7 @@ const T = {
     settings_applied: '✅ Настройки применены',
     // Settings param labels
     lbl_pages_per_url: 'Страниц на URL',
-    hint_pages_per_url: 'Сколько страниц результатов загружать для каждого поискового запроса',
+    hint_pages_per_url: 'Максимум страниц на поиск. По умолчанию 100: API остановится на последней странице или пределе HH (2000 результатов).',
     lbl_response_delay: 'Задержка отклика (с)',
     hint_response_delay: 'Пауза между пачками откликов в секундах',
     lbl_pause_between_cycles: 'Пауза между циклами (с)',
@@ -453,7 +453,7 @@ const T = {
     settings_applied: '✅ Settings applied',
     // Settings param labels
     lbl_pages_per_url: 'Pages per URL',
-    hint_pages_per_url: 'How many result pages to load per search query',
+    hint_pages_per_url: 'Maximum pages per search. Default 100: the API stops at its last page or HH’s 2000-result window.',
     lbl_response_delay: 'Reply delay (s)',
     hint_response_delay: 'Pause between reply batches in seconds',
     lbl_pause_between_cycles: 'Pause between cycles (s)',
@@ -630,6 +630,9 @@ function toggleLang() {
 const State = {
   ws: null,
   lastSnapshot: null,
+  snapshotReceivedAt: null, // monotonic receipt time, never a backend phase timestamp
+  snapshotServerAt: null,
+  snapshotSocket: null,
   currentTab: 'main',
   reconnectDelay: 1000,
   reconnectTimer: null,
@@ -641,6 +644,8 @@ const State = {
   logLevel: '',          // фильтр уровня лога
   lastResponsesHash: '',
   settingsDrafts: new Map(), // key -> number; защищает ввод от фоновых WS snapshot
+  applicationChecks: new Map(), // read-only reconciliation feedback bound to account identity
+  authChecks: new Map(), // explicit verification only; never a background request
 };
 let _llmSettingsEditing = false;
 let _llmSettingsEditTimer = null;
@@ -2139,20 +2144,42 @@ function _extractHrLinks(rows) {
 // значение = ISO-timestamp когда отметили. Восстанавливается после reload.
 const _LLM_DONE_KEY = 'hh-links-done-v1';
 let _llmLinksDone = (() => {
-  try { return JSON.parse(localStorage.getItem(_LLM_DONE_KEY) || '{}') || {}; }
+  try { return _llmReadLinkDone(); }
   catch(e) { return {}; }
 })();
+
+function _llmReadLinkDone() {
+  const value = JSON.parse(localStorage.getItem(_LLM_DONE_KEY) || '{}');
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    throw new Error('Некорректное хранилище отметок');
+  }
+  return value;
+}
+
+window.addEventListener('storage', event => {
+  if (event.key !== _LLM_DONE_KEY && event.key !== null) return;
+  try {
+    _llmLinksDone = _llmReadLinkDone();
+    _llmRenderHrLinks(_llmRowsCache);
+  } catch(e) { /* Keep the last known state if storage is unavailable. */ }
+});
 
 function _llmLinkKey(l) { return `${l.neg_id}|${l.url}`; }
 
 function _llmToggleLinkDone(neg_id, url, btn) {
   const key = `${neg_id}|${url}`;
-  if (_llmLinksDone[key]) {
-    delete _llmLinksDone[key];
-  } else {
-    _llmLinksDone[key] = new Date().toISOString();
+  try {
+    // Re-read before writing: another tab may have changed other links.
+    const latest = _llmReadLinkDone();
+    // Apply the intent displayed in this tab, not a blind toggle of newer state.
+    if (_llmLinksDone[key]) delete latest[key];
+    else latest[key] = new Date().toISOString();
+    localStorage.setItem(_LLM_DONE_KEY, JSON.stringify(latest));
+    _llmLinksDone = latest;
+  } catch(e) {
+    alert('Не удалось сохранить отметку. Проверьте, разрешено ли браузеру хранить данные сайта. Статус не изменён.');
+    return;
   }
-  try { localStorage.setItem(_LLM_DONE_KEY, JSON.stringify(_llmLinksDone)); } catch(e) {}
   // Ре-рендер только этой панели — не трогаем всю таблицу интервью.
   _llmRenderHrLinks(_llmRowsCache);
 }
@@ -2189,8 +2216,7 @@ function _llmRenderHrLinks(rows) {
     const rows = g.items.map(l => {
       const key = _llmLinkKey(l);
       const done = !!_llmLinksDone[key];
-      const negIdAttr = String(l.neg_id).replace(/'/g, "&#39;");
-      const urlAttr = l.url.replace(/'/g, "&#39;");
+      const doneHandler = esc(`_llmToggleLinkDone(${JSON.stringify(String(l.neg_id))},${JSON.stringify(l.url)},this)`);
       // 3 отдельных clickable-зоны:
       //   [🔗 URL]        → открыть саму ссылку HR-а (форма/Telegram/…)
       //   [employer/msg]  → открыть чат с этим HR на hh.ru
@@ -2208,10 +2234,10 @@ function _llmRenderHrLinks(rows) {
       // возвращает 404 (deprecated).
       const chatUrl = `https://hh.ru/chat/${encodeURIComponent(l.neg_id)}`;
       const btn = done
-        ? `<button onclick="_llmToggleLinkDone('${negIdAttr}','${urlAttr}',this)"
+        ? `<button onclick="${doneHandler}"
                     style="background:transparent;border:1px solid var(--green);color:var(--green);border-radius:3px;padding:2px 10px;cursor:pointer;font-size:10px;flex-shrink:0"
                     title="Снять отметку — вернуть в список активных">✓ Пройдено</button>`
-        : `<button onclick="_llmToggleLinkDone('${negIdAttr}','${urlAttr}',this)"
+        : `<button onclick="${doneHandler}"
                     style="background:transparent;border:1px solid var(--dim);color:var(--dim);border-radius:3px;padding:2px 10px;cursor:pointer;font-size:10px;flex-shrink:0"
                     title="Отметить что заполнил/прошёл — уберётся из активных">☐ Пройти</button>`;
       return `
@@ -2585,6 +2611,7 @@ function parseUrlFilter(url) {
 
     const area = p.get('area');
     if (area) parts.push('📍 ' + (HH_AREAS[area] || 'регион ' + area));
+    else parts.push('🌍 Все страны HH');
 
     const exp = p.get('experience');
     if (exp) parts.push('⏱ ' + (HH_EXP[exp] || exp));
@@ -2596,7 +2623,8 @@ function parseUrlFilter(url) {
     if (sched) parts.push(HH_SCHEDULE[sched] || sched);
 
     const role = p.get('professional_role');
-    if (role) parts.push('👔 роль ' + role);
+    const roles = p.getAll('professional_role');
+    if (role) parts.push(roles.length > 1 ? `👔 Специализаций: ${roles.length}` : '👔 роль ' + role);
 
     const order = p.get('order_by');
     if (order === 'publication_time') parts.push('🕐 по дате');
@@ -3247,6 +3275,7 @@ function connect() {
   State.ws = ws;
 
   ws.onopen = () => {
+    if (State.ws !== ws) return;
     document.getElementById('conn-dot').classList.add('connected');
     State.reconnectDelay = 1000;
     // Аудит 2026-08-17 #16: раньше onopen делал disabled=false ВСЕМ кнопкам,
@@ -3257,9 +3286,11 @@ function connect() {
       b.disabled = false;
       b.removeAttribute('data-ws-disabled');
     });
+    tickAccountActivities(); // old connection's snapshot is not fresh on reconnect
   };
 
   ws.onmessage = (ev) => {
+    if (State.ws !== ws) return;
     try {
       const snap = JSON.parse(ev.data);
       if (snap.type === 'state_update') {
@@ -3269,6 +3300,9 @@ function connect() {
         if (Array.isArray(snap.recent_responses)) snap.recent_responses = snap.recent_responses.slice(-100);
         if (Array.isArray(snap.llm_log)) snap.llm_log = snap.llm_log.slice(-200);
         State.lastSnapshot = snap;
+        State.snapshotReceivedAt = performance.now();
+        State.snapshotServerAt = activityTimestamp(snap.snapshot_at);
+        State.snapshotSocket = ws;
         try {
           renderAll(snap);
           const dbg = document.getElementById('dbg-err');
@@ -3283,15 +3317,18 @@ function connect() {
   };
 
   ws.onclose = (ev) => {
+    if (State.ws !== ws) return;
     document.getElementById('conn-dot').classList.remove('connected');
+    tickAccountActivities();
     // Помечаем ws-marker'ом, чтобы onopen снял disabled только с этих кнопок
     // и не тронул те, что заблокированы in-flight операциями (аудит #16).
     document.querySelectorAll('.btn-sm, .apply-btn, button[onclick]').forEach(b => {
-      if (b.id !== 'pause-btn' && !b.disabled) {
+      if (!b.disabled) {
         b.disabled = true;
         b.setAttribute('data-ws-disabled', '1');
       }
     });
+    showCommandError('Нет связи с панелью. Команды паузы недоступны; состояние аккаунтов может быть устаревшим. Ожидаем переподключения.');
     // 4401 = server отверг api_key. Бесконечный reconnect — спам и пустой стрим
     // ошибок в логах (kimi-r14-2 #10). Останавливаем и показываем баннер.
     if (ev && ev.code === 4401) {
@@ -3343,9 +3380,48 @@ function showApiKeyPrompt() {
   overlay.querySelector('input').focus();
 }
 
+function showCommandError(message) {
+  const dbg = document.getElementById('dbg-err');
+  if (dbg) {
+    dbg.style.display = '';
+    dbg.style.whiteSpace = 'normal';
+    dbg.style.overflowWrap = 'anywhere';
+    dbg.setAttribute('role', 'alert');
+    dbg.textContent = message;
+    dbg.title = message;
+  }
+}
+
 function sendCmd(obj) {
-  if (State.ws && State.ws.readyState === 1) {
+  if (!State.ws || State.ws.readyState !== 1) {
+    showCommandError('Нет связи с панелью: команда не отправлена и не поставлена в очередь. Дождитесь подключения и проверьте состояние.');
+    return false;
+  }
+  if (obj?.type === 'account_pause') {
+    const acc = State.lastSnapshot?.accounts?.find(a => a.idx === obj.idx);
+    if (acc?.paused && hasUnknownApplication(acc)) {
+      showCommandError('Исход отклика неизвестен. Сначала нужна сверка в HH; обычное продолжение заблокировано, чтобы не повторить отклик.');
+      return false;
+    }
+    if (acc?.paused && acc.paused_reason === 'auth') {
+      showCommandError(acc.mode === 'oauth'
+        ? 'Сначала подтвердите вход в HH кнопкой «Проверить вход и продолжить». Обычное продолжение не снимает эту защитную паузу.'
+        : 'Восстановите вход в HH для этого аккаунта. Обычное продолжение не снимает защитную паузу авторизации.');
+      return false;
+    }
+    if (acc?.paused && acc.paused_reason === 'network_error') {
+      showCommandError(acc.mode === 'oauth'
+        ? 'Связь с HH ещё не подтверждена. Используйте «Проверить связь и продолжить» или дождитесь серверной проверки; обычное продолжение не снимает эту защитную паузу.'
+        : 'Восстановите связь и доступ к HH для этого аккаунта. Обычное продолжение не снимает защитную паузу сети.');
+      return false;
+    }
+  }
+  try {
     State.ws.send(JSON.stringify(obj));
+    return true;
+  } catch (_) {
+    showCommandError('Не удалось передать команду панели. Она не повторяется автоматически; проверьте связь и состояние аккаунта.');
+    return false;
   }
 }
 
@@ -3401,6 +3477,7 @@ function syncAccountDependentUi(snap) {
       delete State.prevInterviews[idx];
       delete State.prevLimitState[idx];
       delete State.prevCookiesExpired[idx];
+      State.authChecks.delete(Number(idx));
       for (const key of [..._urlPreviewCache.keys()]) {
         if (String(key).startsWith(idx + '|')) _urlPreviewCache.delete(key);
       }
@@ -3499,6 +3576,7 @@ function renderHeader(snap) {
   if (filterEl && snap.config) {
     const badges = [];
     if (snap.config.filter_agencies) badges.push('🏢 Без агентств');
+    if (snap.config.remote_it_only) badges.push('ИТ · только удалёнка');
     if (snap.config.filter_low_competition) badges.push('🎯 <10 откликов');
     if (snap.config.search_period_days > 0) badges.push(`📅 ${snap.config.search_period_days}д`);
     const protectedCount = (snap.accounts || []).filter(a => a.safety_enabled).length;
@@ -3516,6 +3594,12 @@ function renderHeader(snap) {
       btn.textContent = pausedAccs ? `${t('btn_pause')} (${pausedAccs})` : t('btn_pause');
       btn.classList.remove('paused');
     }
+  }
+
+  const pauseControl = document.getElementById('pause-btn');
+  if (pauseControl) {
+    pauseControl.disabled = !State.ws || State.ws.readyState !== 1;
+    pauseControl.title = pauseControl.disabled ? 'Нет связи с панелью: команда паузы недоступна' : '';
   }
 
   // Apply mode badge — show per-account summary
@@ -3613,11 +3697,48 @@ function buildCardHTML(acc) {
       <button id="acc-oauth-btn-${acc.idx}" style="font-size:9px;padding:1px 6px;border-radius:3px;border:1px solid;cursor:pointer;background:transparent;margin-left:4px;color:${acc.use_oauth ? 'var(--green)' : 'var(--cyan)'};border-color:${acc.use_oauth ? 'var(--green)' : 'var(--cyan)'}"
         onclick="oauthToggleAccount(${acc.idx},this)" title="Метод откликов: OAuth API или Web cookies">${acc.use_oauth ? '🔑API' : '🌐Web'}</button>
     </div>
+    <section class="acc-activity" id="acc-activity-${acc.idx}" aria-label="Текущий этап работы">
+      <div class="acc-activity-heading"><span class="acc-activity-eyebrow">Состояние бота</span> <span class="acc-activity-chip" data-activity="phase">Ожидаем данные</span></div>
+      <div class="acc-activity-current" data-activity="current">Ожидаем состояние панели</div>
+      <div class="acc-activity-next"><span class="acc-activity-label">Следующий шаг</span> <span data-activity="next">Пока не указано сервером</span></div>
+      <div class="acc-activity-action" data-activity="action" hidden></div>
+      <div class="acc-activity-meta" data-activity="progress" hidden></div>
+      <progress class="acc-activity-meter" data-activity-meter aria-label="Прогресс текущего этапа" max="100" hidden></progress>
+      <div class="acc-activity-meta" data-activity="time" hidden></div>
+      <div class="acc-network-meta" data-activity="network" hidden></div>
+      <div class="acc-search-box"><div class="acc-search-label">Почему ждём</div><div class="acc-search-summary" data-activity="situation" hidden></div></div>
+      <section class="acc-cycle" id="acc-cycle-${acc.idx}" aria-label="Отчёт за цикл">
+        <div class="acc-cycle-heading"><span data-cycle="title">За цикл</span> <span data-cycle="status"></span></div>
+        <div class="acc-cycle-note" data-cycle="empty">Отчёт появится с новым циклом поиска. Дневной итог сохранён ниже.</div>
+        <div data-cycle="body" hidden>
+          <div class="acc-cycle-grid">
+            <div><span data-cycle="found">—</span><small>Найдено</small></div>
+            <div><span data-cycle="sent">—</span><small>Отклики</small></div>
+            <div><span data-cycle="skipped">—</span><small>Пропущено</small></div>
+            <div><span data-cycle="remaining">—</span><small>Осталось</small></div>
+          </div>
+          <div class="acc-cycle-warning" data-cycle="notice" hidden></div>
+          <div class="acc-cycle-warning" data-cycle="flags" hidden></div>
+          <div class="acc-cycle-note" data-cycle="pagination" hidden></div>
+          <details class="acc-cycle-details" data-cycle="details">
+            <summary>Детали цикла и причины</summary>
+            <div class="acc-cycle-note" data-cycle="processed"></div>
+            <div class="acc-cycle-note" data-cycle="preview" hidden></div>
+            <div class="acc-cycle-facts" data-cycle="facts"></div>
+            <div class="acc-cycle-facts" data-cycle="reasons"></div>
+          </details>
+        </div>
+      </section>
+      <div class="acc-activity-freshness" data-activity="freshness">Нет свежих данных: последнее известное состояние</div>
+    </section>
     <div class="acc-progress"><div class="acc-progress-fill" id="acc-prog-${acc.idx}"></div></div>
     <div class="acc-stats">
-      <div class="stat-box" title="Сессия / Всего за всё время / Реально из HH сегодня">
-        <div class="stat-val c-green" id="acc-sent-${acc.idx}">0</div>
-        <div class="stat-lbl">${t('stat_replies')} <span style="color:var(--dim);font-size:10px">/ <span id="acc-total-${acc.idx}">0</span> · <span id="acc-hh-today-${acc.idx}" title="HH сегодня / лимит">—</span></span></div>
+      <div class="stat-box acc-apply-summary" title="Подтверждённые отклики бота сегодня и за текущий запуск; отдельный счётчик HH">
+        <div class="acc-apply-counts">
+          <div><div class="stat-val c-green" id="acc-daily-${acc.idx}">—</div><div class="stat-lbl">Сегодня · бот</div></div>
+          <div><div class="stat-val acc-session-value" id="acc-sent-${acc.idx}">0</div><div class="stat-lbl">За этот запуск</div></div>
+        </div>
+        <div class="acc-apply-totals">Всего бот: <span id="acc-total-${acc.idx}">0</span> · <span id="acc-hh-today-${acc.idx}" title="Отдельный счётчик HH сегодня / лимит">—</span></div>
       </div>
       <div class="stat-box">
         <div class="stat-val c-magenta" id="acc-tests-${acc.idx}">0</div>
@@ -3647,6 +3768,14 @@ function buildCardHTML(acc) {
     </div>
     <div class="acc-vacancy" id="acc-vacancy-${acc.idx}">
       <div class="acc-vacancy-title c-dim">${t('card_waiting')}</div>
+    </div>
+    <div id="acc-application-check-${acc.idx}" style="display:none;margin:7px 0;overflow-wrap:anywhere">
+      <button class="btn-sm" id="acc-application-check-btn-${acc.idx}" onclick="reconcileApplication(${acc.idx})" style="max-width:100%;white-space:normal">Проверить в HH и продолжить</button>
+      <div id="acc-application-check-result-${acc.idx}" role="status" style="font-size:11px;margin-top:5px;line-height:1.45"></div>
+    </div>
+    <div class="acc-auth-check" id="acc-auth-check-${acc.idx}" hidden>
+      <button class="btn-sm" id="acc-auth-check-btn-${acc.idx}" onclick="recheckAccountAuth(${acc.idx})">Проверить вход и продолжить</button>
+      <div id="acc-auth-check-result-${acc.idx}" role="status"></div>
     </div>
     <div class="acc-meta" id="acc-meta-${acc.idx}"></div>
     <div class="acc-hh-stats" id="acc-hh-${acc.idx}">${t('card_hh_loading')}</div>
@@ -3776,6 +3905,14 @@ function buildCardHTML(acc) {
       <summary>🎯 Конверсия откликов</summary>
       <div class="acc-letter-body" id="acc-conversion-${acc.idx}" style="font-size:11px;color:var(--dim)">Откройте для расчёта.</div>
     </details>
+    <details class="acc-letter-wrap">
+      <summary>💬 Контакт до отклика</summary>
+      <div class="acc-letter-body">
+        <input id="contact-vid-${acc.idx}" placeholder="ID вакансии или ссылка HH" aria-label="Вакансия для проверки контактов">
+        <button class="btn-sm" onclick="checkVacancyContact(${acc.idx},this)">Проверить</button>
+        <div id="contact-result-${acc.idx}" aria-live="polite">Только проверка. Сообщения не отправляются.</div>
+      </div>
+    </details>
     ${acc.temp ? (() => {
       // HH SSR отдаёт title как list of {string: "..."} — нормализуем
       const normTitle = (t) => {
@@ -3833,6 +3970,9 @@ function buildCardHTML(acc) {
           <label style="cursor:pointer;display:flex;align-items:center;gap:4px">
             <input type="checkbox" class="smart-filter-cb" data-key="filter_agencies" style="accent-color:var(--yellow)"> 🏢 ${t('smart_filter_no_agency')}
           </label>
+          <label style="cursor:pointer;display:flex;align-items:center;gap:4px">
+            <input type="checkbox" class="smart-filter-cb" data-key="remote_it_only" style="accent-color:var(--cyan)"> Только ИТ + удалёнка (все поиски)
+          </label>
           <label id="acc-safety-label-${acc.idx}" style="cursor:pointer;display:flex;align-items:center;gap:4px" title="Настройка только этого аккаунта: HH выбирает подходящее резюме; обязательные несовпадения, предупреждения о недостоверности и redirect-дубликаты пропускаются">
             <input type="checkbox" id="acc-safety-cb-${acc.idx}" ${acc.safety_enabled ? 'checked' : ''}
               onchange="safetyToggle(${acc.idx},this)" style="accent-color:var(--cyan)"> ⚡ ${t('smart_filter_pre_check')}
@@ -3851,6 +3991,9 @@ function buildCardHTML(acc) {
           </label>
           <label style="cursor:pointer;display:flex;align-items:center;gap:4px" title="Старые вакансии не расходуют защищённый остаток дневного лимита">
             <input type="checkbox" class="smart-filter-cb" data-key="fresh_vacancies_mode" style="accent-color:var(--green)"> 🆕 ${t('smart_filter_fresh_reserve')}
+          </label>
+          <label style="cursor:pointer;display:flex;align-items:center;gap:4px" title="Для всех аккаунтов, со следующего сбора. Внутри категории свежести: менеджер онлайн, затем совпадение навыков. Если HH не прислал сигналы, используется обычный порядок. Онлайн не гарантирует ответ.">
+            <input type="checkbox" class="smart-filter-cb" data-key="prefer_hh_signals" style="accent-color:var(--cyan)"> 📡 Приоритет по сигналам HH
           </label>
         </div>
         <div style="display:flex;flex-wrap:wrap;gap:6px 14px;margin-bottom:8px">
@@ -3884,7 +4027,489 @@ function buildCardHTML(acc) {
   `;
 }
 
+function activityTimestamp(value) {
+  if (typeof value !== 'string' || !/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,9})?(?:Z|[+-]\d{2}:\d{2})$/.test(value)) return null;
+  const timestamp = Date.parse(value);
+  return Number.isFinite(timestamp) ? timestamp : null;
+}
+
+function activityDuration(seconds) {
+  const value = Math.max(0, Math.floor(seconds));
+  if (value >= 86400) return `${Math.floor(value / 86400)} д ${Math.floor(value % 86400 / 3600)} ч`;
+  if (value >= 3600) return `${Math.floor(value / 3600)} ч ${Math.floor(value % 3600 / 60)} мин`;
+  if (value >= 60) return `${Math.floor(value / 60)} мин ${value % 60} с`;
+  return `${value} с`;
+}
+
+function cycleReportView(report) {
+  const valid = report && typeof report === 'object' && !Array.isArray(report)
+    && typeof report.cycle_id === 'string' && report.cycle_id.trim().length > 0
+    && report.cycle_id.length <= 128 && activityTimestamp(report.started_at) !== null;
+  if (!valid) return {available: false};
+  const count = value => Number.isSafeInteger(value) && value >= 0 ? value : null;
+  const show = value => count(value) === null ? '—' : String(value);
+  const finished = activityTimestamp(report.finished_at) !== null;
+  const statuses = {running: 'В работе', waiting: 'Ожидание', blocked: 'Приостановлен', error: 'Ошибка в цикле'};
+  const reasons = (Array.isArray(report.skip_reasons) ? report.skip_reasons : [])
+    .filter(item => item && typeof item.label === 'string' && item.label.trim() && count(item.count) > 0)
+    .slice(0, 50).map(item => ({label: item.label.trim().slice(0, 160), count: item.count}))
+    .sort((a, b) => b.count - a.count);
+  const flags = [];
+  const searchStops = {hh_limit: 'Достигнут предел выдачи HH — это не весь рынок вакансий',
+    empty_page: 'Страница без вакансий; конец веб-выдачи не подтверждён',
+    configured_limit: 'Достигнут настроенный предел страниц — поиск просмотрен не полностью',
+    repeated_page: 'HH повторил страницу; загрузка остановлена',
+    missing_pagination: 'HH не сообщил конец выдачи', invalid_response: 'Не удалось прочитать страницу поиска',
+    cancelled: 'Загрузка страниц прервана'};
+  for (const reason of Array.isArray(report.search_stop_reasons) ? report.search_stop_reasons : [])
+    if (Object.hasOwn(searchStops, reason)) flags.push(searchStops[reason]);
+  if (count(report.unknown) > 0) flags.push(`Не подтверждено: ${report.unknown} (не считаются отправленными)`);
+  if (count(report.errors) > 0) flags.push(`Ошибки по вакансиям: ${report.errors}`);
+  if (count(report.operation_errors) > 0) flags.push(`Ошибки операций: ${report.operation_errors}`);
+  if (count(report.questionnaires_pending) > 0) flags.push(`Анкеты ждут ответа: ${report.questionnaires_pending}`);
+  const facts = [
+    `Найдено до общего удаления дублей: ${show(report.found_raw)}`,
+    `Уникальных полученных вакансий: ${show(report.found_unique)}`,
+    `Рассмотрено фильтрами: ${show(report.considered)}`,
+    `Учтено исходов: ${show(report.processed)} (включая неподтверждённые)`,
+    `Подтверждённые отклики: ${show(report.sent)}`,
+    `Уже откликались: ${show(report.already)} (входит в «Пропущено»)`,
+    `Ошибки по вакансиям: ${show(report.errors)}; ошибки операций: ${show(report.operation_errors)}`,
+    `Исход не подтверждён: ${show(report.unknown)}; анкеты ждут ответа: ${show(report.questionnaires_pending)}`,
+    'Осталось — вакансии без учтённого результата; анкеты, ожидающие ответа, входят в остаток.'
+  ];
+  return {available: true, identity: report.cycle_id,
+    title: finished ? 'За последний цикл' : 'За текущий цикл',
+    status: statuses[report.status] || 'Статус не указан',
+    found: show(report.found_unique), sent: show(report.sent), skipped: show(report.skipped), remaining: show(report.remaining),
+    processed: `Разобрано: ${show(report.processed)} · за этот цикл`,
+    notice: report.partial === true ? 'Промежуточный или неполный итог — подробности ниже.' : '',
+    flags: flags.join('\n'),
+    pagination: count(report.search_pages_loaded) !== null ? `Загружено страниц поиска: ${report.search_pages_loaded}` : '',
+    preview: reasons.length ? 'Пропуски: ' + reasons.slice(0, 2).map(item => `${item.label} — ${item.count}`).join('; ')
+      + (reasons.length > 2 ? `; ещё причин: ${reasons.length - 2}` : '') : '',
+    facts: facts.join('\n'), reasons: reasons.map(item => `${item.label}: ${item.count}`).join('\n')};
+}
+
+function renderCycleReport(acc) {
+  const region = document.getElementById('acc-cycle-' + acc.idx);
+  if (!region) return;
+  const view = cycleReportView(acc.cycle_report);
+  const body = region.querySelector('[data-cycle="body"]');
+  const empty = region.querySelector('[data-cycle="empty"]');
+  if (body) body.hidden = !view.available;
+  if (empty) empty.hidden = view.available;
+  const details = region.querySelector('[data-cycle="details"]');
+  if (region._cycleIdentity !== view.identity && details) details.open = false;
+  region._cycleIdentity = view.identity;
+  for (const key of ['title', 'status', 'found', 'sent', 'skipped', 'remaining', 'processed', 'notice', 'flags', 'pagination', 'preview', 'facts', 'reasons']) {
+    const node = region.querySelector(`[data-cycle="${key}"]`);
+    if (!node) continue;
+    const value = view.available ? view[key] : (key === 'title' ? 'За цикл' : '');
+    if (node.textContent !== value) node.textContent = value;
+    node.hidden = !value;
+  }
+}
+
+function networkRecoveryDetails(acc) {
+  if (acc.paused !== true || acc.paused_reason !== 'network_error') return '';
+  const recovery = acc.network_recovery;
+  if (!recovery || typeof recovery !== 'object' || Array.isArray(recovery)) return '';
+  const reasons = {proxy_error: 'ошибка соединения через прокси', tls_error: 'ошибка защищённого соединения',
+    connect_timeout: 'не удалось вовремя подключиться к HH', read_timeout: 'HH не ответил вовремя',
+    timeout: 'время ожидания HH истекло', connection_error: 'соединение с HH недоступно',
+    network_error: 'сетевая ошибка'};
+  const outcomes = {network: 'связь ещё не подтверждена', auth: 'нужно подтвердить вход в HH',
+    challenge: 'HH запрашивает проверку доступа', rate_limit: 'HH ограничил частоту запросов',
+    unavailable: 'безопасная проверка сейчас недоступна', stale: 'состояние изменилось; нужна новая проверка'};
+  const parts = ['Причина паузы: ' + (typeof recovery.reason === 'string' && Object.hasOwn(reasons, recovery.reason)
+    ? reasons[recovery.reason] : 'связь с HH не подтверждена')];
+  if (Number.isSafeInteger(recovery.attempts) && recovery.attempts >= 0)
+    parts.push('Попыток проверки связи: ' + recovery.attempts);
+  if (typeof recovery.last_error === 'string' && Object.hasOwn(outcomes, recovery.last_error)) {
+    const stopped = recovery.next_check_at === null && recovery.last_error !== 'network';
+    parts.push((stopped ? 'Автопроверки остановлены: ' : 'Последний результат: ') + outcomes[recovery.last_error]);
+  }
+  return parts.join('\n');
+}
+
+function accountActivityView(acc, fresh, now, globalPaused = false) {
+  const activity = acc.activity && typeof acc.activity === 'object' && !Array.isArray(acc.activity)
+    ? acc.activity : null;
+  const text = value => typeof value === 'string' ? value.trim().slice(0, 1000) : '';
+  const supplied = Boolean(activity && text(activity.current));
+  const fallbackNames = {idle: 'Ожидание', collecting: 'Сбор вакансий', applying: 'Отправка отклика',
+    waiting: 'Ожидание', checking: 'Проверка лимита', limit: 'Лимит откликов', '—': 'Бот не запущен'};
+  const pause = supplied ? null : accountPauseInfo(acc, globalPaused);
+  let current = supplied ? text(activity.current)
+    : pause ? pause.label + '. ' + pause.detail
+      : text(acc.status_detail) || fallbackNames[acc.status] || 'Состояние не указано';
+  let next = supplied ? text(activity.next) || 'Пока не указано сервером' : 'Пока не указано сервером';
+  let situation = '';
+  const report = acc.cycle_report;
+  // Explain only a fresh, complete, empty-result cycle. Never mask protective
+  // pauses, a reserve, unfinished questionnaires, partial searches or errors.
+  if (fresh && supplied && ['cycle_wait', 'no_new'].includes(activity.phase)
+      && !globalPaused && !acc.paused && !acc.hard_stopped && !acc.limit_exceeded
+      && !acc.pending_apply && !(acc.pending_applies?.length) && activity.requires_action === false
+      && cycleReportView(report).available && activityTimestamp(report.finished_at) !== null
+      && report.status === 'waiting' && report.partial === false
+      && ['sent', 'remaining', 'errors', 'operation_errors', 'unknown', 'questionnaires_pending'].every(k => report[k] === 0)
+      && Number.isSafeInteger(report.found_unique) && report.found_unique >= 0
+      && report.processed === report.found_unique && report.skipped === report.found_unique
+      && Number.isSafeInteger(report.already) && report.already >= 0 && report.already <= report.found_unique
+      && Array.isArray(report.skip_reasons)
+      && !report.skip_reasons.some(item => ['fresh_reserve', 'hh_limit', 'cancelled'].includes(item?.key))) {
+    current = report.found_unique === 0 ? 'Текущий поиск не нашёл вакансий'
+      : report.already >= report.found_unique * 0.9 ? 'В текущем поиске почти всё уже обработано'
+      : 'В текущей выдаче нет вакансий для нового отклика';
+    const reasons = (Array.isArray(report.skip_reasons) ? report.skip_reasons : [])
+      .filter(item => item && item.key !== 'already' && typeof item.label === 'string'
+        && Number.isSafeInteger(item.count) && item.count > 0)
+      .slice(0, 3).map(item => `${item.label.slice(0, 100)}: ${item.count}`);
+    situation = `Найдено: ${report.found_unique}\nУже откликались: ${report.already} (за разные дни)`
+      + (reasons.length ? '\n' + reasons.map(reason => '• ' + reason).join('\n') : '');
+    next = 'Повторит поиск новых вакансий. Чтобы увеличить выбор, можно расширить поисковые запросы.';
+  }
+  const progress = supplied ? activity.progress : null;
+  const validProgress = progress && Number.isSafeInteger(progress.done) && Number.isSafeInteger(progress.total)
+    && progress.done >= 0 && progress.total > 0 && progress.done <= progress.total;
+  const times = [];
+  if (supplied && fresh && Number.isFinite(now)) {
+    const started = activityTimestamp(activity.started_at);
+    let until = activityTimestamp(activity.wait_until);
+    const networkWait = activity.phase === 'network_recovery';
+    // Never invent a recovery schedule from attempt count or show a timer under
+    // another protective pause. A network deadline must match the saved schedule.
+    if (networkWait && (globalPaused || acc.paused_reason !== 'network_error' || activity.requires_action !== false
+      || ![null, undefined, 'network'].includes(acc.network_recovery?.last_error)
+      || until !== activityTimestamp(acc.network_recovery?.next_check_at))) until = null;
+    if (acc.paused_reason === 'network_error' && !networkWait) until = null;
+    if (started !== null && started <= now) times.push('На этом этапе: ' + activityDuration((now - started) / 1000));
+    if (until !== null) times.push(until > now
+      ? (networkWait ? 'До проверки связи: ' : 'Ожидание: ещё ') + activityDuration(Math.ceil((until - now) / 1000))
+      : networkWait ? 'Время проверки наступило; ждём новый статус' : 'Плановое время наступило; ждём новый статус');
+  }
+  return {current, next, progress: validProgress ? `Прогресс этапа: ${progress.done} / ${progress.total}` : '',
+    time: times.join('\n'), network: networkRecoveryDetails(acc), situation,
+    requiresAction: supplied && activity.requires_action === true, stale: !fresh};
+}
+
+function renderAccountActivity(acc, monotonicNow = performance.now(), wallNow = Date.now()) {
+  const region = document.getElementById('acc-activity-' + acc.idx);
+  if (!region) return;
+  renderCycleReport(acc);
+  const received = State.snapshotReceivedAt;
+  const age = Number.isFinite(received) ? monotonicNow - received : null;
+  const fresh = Boolean(State.ws && State.ws.readyState === 1 && State.snapshotSocket === State.ws
+    && age !== null && age >= 0 && age <= 15000);
+  // Anchor durations to server time, not the potentially skewed browser clock.
+  const now = Number.isFinite(State.snapshotServerAt) && age !== null
+    ? State.snapshotServerAt + age : wallNow;
+  const view = accountActivityView(acc, fresh, now, State.lastSnapshot?.paused === true);
+  const phase = acc.activity?.phase;
+  const phases = {collecting: 'Поиск вакансий', search: 'Поиск вакансий', apply: 'Отправка отклика',
+    collect: 'Поиск вакансий', search_setup: 'Подготовка поиска', filter: 'Отбор вакансий',
+    no_new: 'Ждёт новые вакансии', fresh_reserve: 'Резерв для свежих вакансий',
+    resume_check: 'Проверка резюме', resume_touch: 'Поднятие резюме', limit_wait: 'Ожидание лимита',
+    recover_error: 'Повтор после сбоя', manual_pause: 'На паузе', challenge: 'Проверка доступа HH',
+    hh_rate_limit: 'Ограничение запросов HH', message_outcome_unknown: 'Нужна проверка сообщения',
+    preflight: 'Проверка вакансии', questionnaire: 'Заполнение анкеты', cycle_wait: 'Ждёт новые вакансии',
+    wait_between_batches: 'Плановая пауза', network_recovery: 'Восстанавливает связь',
+    network_error: 'Нет связи', auth_check: 'Проверка входа', auth: 'Нужен вход',
+    receipt_check: 'Проверка результата', outcome_unknown: 'Нужна сверка',
+    limit: 'Лимит откликов', limit_check: 'Проверка лимита', stopped: 'Остановлен',
+    manual: 'На паузе', global_pause: 'Общая пауза', auto_errors: 'Защитная пауза', idle: 'Ожидание'};
+  const tone = !fresh ? 'stale' : view.requiresAction || phase === 'recover_error' ? 'attention'
+    : ['cycle_wait', 'wait_between_batches', 'idle', 'stopped', 'manual', 'manual_pause', 'global_pause',
+      'limit', 'limit_wait', 'no_new', 'fresh_reserve'].includes(phase) ? 'waiting' : 'active';
+  region.dataset.tone = tone;
+  const meter = region.querySelector('[data-activity-meter]');
+  if (meter) {
+    meter.hidden = !fresh || !view.progress;
+    if (!meter.hidden) {
+      meter.max = acc.activity.progress.total;
+      meter.value = acc.activity.progress.done;
+    }
+  }
+  const values = {current: view.current, next: view.next, progress: view.progress, time: view.time, network: view.network,
+    situation: view.situation,
+    phase: !fresh ? 'Нет свежих данных' : Object.hasOwn(phases, phase) ? phases[phase]
+      : view.requiresAction ? 'Нужно ваше внимание' : 'Текущий этап',
+    action: view.requiresAction ? 'Требуется ваше действие' : '',
+    freshness: fresh ? `Обновлено ${activityDuration(age / 1000)} назад`
+      : 'Нет свежих данных: последнее известное состояние'};
+  for (const [key, value] of Object.entries(values)) {
+    const node = region.querySelector(`[data-activity="${key}"]`);
+    if (!node) continue;
+    if (node.textContent !== value) node.textContent = value;
+    node.hidden = !value;
+  }
+  region.classList.toggle('is-stale', view.stale);
+  region.classList.toggle('requires-action', view.requiresAction);
+}
+
+function tickAccountActivities() {
+  const now = performance.now(), wallNow = Date.now();
+  for (const acc of State.lastSnapshot?.accounts || []) renderAccountActivity(acc, now, wallNow);
+}
+
+setInterval(tickAccountActivities, 1000); // local display only: no requests or worker commands
+
+function hasUnknownApplication(acc) {
+  return acc.paused_reason === 'outcome_unknown'
+    || Boolean(acc.pending_apply && typeof acc.pending_apply === 'object')
+    || (Array.isArray(acc.pending_applies) && acc.pending_applies.length > 0);
+}
+
+function accountPauseInfo(acc, globalPaused = false) {
+  const unknown = hasUnknownApplication(acc);
+  if (!acc.paused && !globalPaused && !unknown) return null;
+  const reason = acc.paused_reason;
+  let label, detail, cls = 'status-idle';
+  if (unknown) {
+    label = '⚠ Исход отклика неизвестен';
+    detail = 'Нужна сверка результата в HH. Не отправляйте этот отклик повторно: сервер мог его принять. Проверка ниже не отправляет новый отклик.';
+    cls = 'status-limit';
+  } else if (reason === 'auto_errors') {
+    label = '⏸ Авто-пауза: ошибки подряд';
+    detail = 'Проверьте журнал ошибок и связь с HH перед продолжением.';
+    cls = 'status-limit';
+  } else if (reason === 'auth') {
+    label = '🔐 Пауза: нужна авторизация';
+    detail = 'Доступ к HH требует проверки. Обычное продолжение не обновляет авторизацию.';
+    cls = 'status-limit';
+  } else if (reason === 'network_error') {
+    label = '⏸ Пауза: нет подтверждённой связи с HH';
+    detail = 'Сетевая ошибка не означает, что вход истёк. Продолжение — только после проверки связи и доступа; обычное продолжение не снимает защиту.';
+    cls = 'status-waiting';
+  } else if (reason === 'hh_rate_limit') {
+    label = '⏸ HH ограничил частоту запросов';
+    detail = 'Ограничение запросов не подтверждает выход из аккаунта. Автоматические попытки приостановлены; нужна проверка доступа к HH.';
+    cls = 'status-waiting';
+  } else if (reason === 'challenge') {
+    label = '⏸ HH запрашивает проверку доступа';
+    detail = 'Нужна ручная проверка на HH. Повторные автоматические попытки приостановлены; это не подтверждение истёкшего входа.';
+    cls = 'status-waiting';
+  } else if (reason === 'limit' || acc.limit_exceeded || acc.hard_stopped) {
+    cls = 'status-limit';
+    const hhUsed = acc.hh_today_applies || 0, hhLimit = acc.hh_daily_limit || 200;
+    if (acc.hard_stopped && hhUsed >= hhLimit) label = `🛑 HH-лимит ${hhUsed}/${hhLimit}`;
+    else if (acc.hard_stopped && acc.daily_limit > 0 && acc.daily_sent >= acc.daily_limit) label = `🛑 ${t('status_daily_limit')} ${acc.daily_sent}/${acc.daily_limit}`;
+    else label = '🚫 ' + t('status_hh_limit');
+    detail = 'Достигнут лимит откликов. Проверьте счётчики и время сброса; продолжение не отменяет лимит HH.';
+  } else {
+    label = acc.paused ? t('status_acc_paused') : t('status_all_paused');
+    detail = acc.paused ? 'Аккаунт приостановлен.' : 'Отклики остановлены общей паузой.';
+  }
+  const status = typeof acc.status_detail === 'string' ? acc.status_detail.trim() : '';
+  // Старые worker snapshots могли заменять любую причину текстом manual pause.
+  if (status && !(reason && reason !== 'manual' && status === 'Пауза пользователем')) detail = status + ' ' + detail;
+  if (globalPaused && (acc.paused || unknown)) detail = 'Также включена общая пауза. ' + detail;
+  return {label, detail, cls, unknown};
+}
+
+function renderAccountVacancy(acc, pauseInfo) {
+  if (pauseInfo) {
+    const previous = acc.current_vacancy_title
+      ? `<div class="acc-vacancy-company c-dim" style="margin-top:6px">Последняя вакансия: ${esc(acc.current_vacancy_title)}</div>` : '';
+    if (pauseInfo.unknown && typeof acc.activity?.current === 'string' && acc.activity.current.trim()) {
+      // The activity block already explains the hold and its next step. Keep the
+      // safety note next to the check button without repeating all three notices.
+      return `<div class="acc-protective-note">Не отправляйте повторно: HH мог принять отклик. Проверка только сверяет результат.</div>${previous}`;
+    }
+    if (acc.paused_reason === 'network_error' && typeof acc.activity?.current === 'string' && acc.activity.current.trim()) {
+      return `<div class="acc-protective-note">Проверки связи не отправляют отклики. Продолжение — только после подтверждения связи и доступа к HH; остальные ограничения сохраняются.</div>${previous}`;
+    }
+    return `<div class="acc-vacancy-title" style="white-space:normal;overflow-wrap:anywhere">${esc(pauseInfo.label)}</div>
+      <div style="font-size:12px;line-height:1.45;margin-top:4px;white-space:normal;overflow-wrap:anywhere">${esc(pauseInfo.detail)}</div>${previous}`;
+  }
+  if (acc.current_vacancy_title) return `<div class="acc-vacancy-title">${esc(acc.current_vacancy_title)}</div>
+    <div class="acc-vacancy-company c-dim">@ ${esc(acc.current_vacancy_company)}</div>
+    <div style="font-size:11px;margin-top:4px">${renderVacancySignals(acc.current_vacancy_signals, State.lastSnapshot?.config?.prefer_hh_signals === true)}</div>`;
+  return `<div class="acc-vacancy-title c-dim">${acc.status === 'applying' ? t('card_sending') : (esc(acc.status_detail) || t('card_waiting'))}</div>`;
+}
+
+function applicationCheckIdentity(acc) {
+  return JSON.stringify([acc.idx, acc.temp === true, acc.resume_hash || '', acc.name || acc.short || '']);
+}
+
+function applicationCheckState(acc) {
+  const pending = acc.pending_apply && typeof acc.pending_apply === 'object'
+    ? acc.pending_apply : (Array.isArray(acc.pending_applies) ? acc.pending_applies[0] : null);
+  const pendingIdentity = pending ? JSON.stringify([pending.vacancy_id ?? null,
+    pending.resume_id ?? null, pending.recorded_at ?? null]) : '';
+  const source = pending ? JSON.stringify([pendingIdentity, pending.reconcile_last_started_at ?? null]) : '';
+  const activity = acc.activity;
+  const nextAt = pending ? activityTimestamp(pending.reconcile_next_at) : null;
+  const scheduled = activity?.phase === 'outcome_unknown' && activity.requires_action === false
+    && Number.isSafeInteger(pending?.reconcile_attempts) && pending.reconcile_attempts >= 0
+    && pending.reconcile_attempts < 3 && nextAt !== null && activityTimestamp(activity.wait_until) === nextAt;
+  return {pendingIdentity, source, scheduled, checking: activity?.phase === 'receipt_check'};
+}
+
+function renderApplicationCheck(acc) {
+  const region = document.getElementById('acc-application-check-' + acc.idx);
+  if (!region) return;
+  let entry = State.applicationChecks.get(acc.idx);
+  const check = applicationCheckState(acc);
+  if (entry && (entry.identity !== applicationCheckIdentity(acc)
+      || (!entry.busy && entry.source !== check.source))) {
+    State.applicationChecks.delete(acc.idx);
+    entry = null;
+  }
+  const pending = hasUnknownApplication(acc);
+  region.style.display = pending || entry ? '' : 'none';
+  const button = document.getElementById('acc-application-check-btn-' + acc.idx);
+  if (button) {
+    button.style.display = pending ? '' : 'none';
+    button.disabled = Boolean(entry?.busy) || check.checking || !State.ws || State.ws.readyState !== 1;
+    button.textContent = entry?.busy || check.checking ? 'Проверяем результат в HH…'
+      : check.scheduled ? 'Проверить сейчас' : 'Проверить в HH и продолжить';
+    button.title = 'Только сверка уже отправленного отклика. Новый отклик не отправляется; при нескольких неопределённых результатах проверяем по одному.';
+  }
+  const result = document.getElementById('acc-application-check-result-' + acc.idx);
+  if (result) result.textContent = entry?.message || '';
+}
+
+async function reconcileApplication(idx) {
+  const acc = State.lastSnapshot?.accounts?.find(a => a.idx === idx);
+  if (!acc || !hasUnknownApplication(acc)) return false;
+  if (!State.ws || State.ws.readyState !== 1) {
+    showCommandError('Нет связи с панелью. Дождитесь свежего состояния перед проверкой в HH.');
+    return false;
+  }
+  const identity = applicationCheckIdentity(acc);
+  const check = applicationCheckState(acc);
+  if (check.checking) return false; // server is already checking; never overlap it
+  if (State.applicationChecks.get(idx)?.busy) return false;
+  const entry = {identity, source: check.source, pendingIdentity: check.pendingIdentity,
+    busy: true, message: 'Сверяем уже отправленный отклик. Повторной отправки нет.'};
+  State.applicationChecks.set(idx, entry);
+  renderApplicationCheck(acc);
+  try {
+    const response = await fetch(`/api/account/${idx}/reconcile-application`, {method: 'POST'});
+    const result = await response.json();
+    if (response.ok && result?.ok === true && result.confirmed === true
+        && typeof result.paused === 'boolean' && typeof result.pending === 'boolean') {
+      entry.message = result.pending === true
+        ? 'Этот отклик подтверждён. Остались другие неопределённые результаты — проверьте следующий отдельно.'
+        : result.paused === true
+          ? 'Отклик подтверждён. Аккаунт остаётся на паузе; проверьте её причину.'
+          : 'Отклик подтверждён. Блокировка неизвестного исхода снята; ожидаем свежий статус панели.';
+    } else {
+      entry.message = typeof result?.message === 'string' && result.message.trim()
+        ? result.message.slice(0, 500) : 'Проверка не подтвердила отклик. Пауза сохранена; повторный отклик не отправлялся.';
+    }
+  } catch (_) {
+    entry.message = 'Не удалось получить результат проверки. Она не повторяется автоматически; повторный отклик не отправлялся. Проверьте связь и свежий статус.';
+  } finally {
+    entry.busy = false;
+    const current = State.lastSnapshot?.accounts?.find(a => a.idx === idx);
+    if (State.applicationChecks.get(idx) === entry && current && applicationCheckIdentity(current) === identity) {
+      const latest = applicationCheckState(current);
+      if (latest.pendingIdentity !== entry.pendingIdentity) State.applicationChecks.delete(idx);
+      // Persisted last_started_at belongs only to automatic checks. If it changed
+      // during this request, render clears our now-stale feedback after busy ends.
+      renderApplicationCheck(current);
+    } else if (State.applicationChecks.get(idx) === entry) State.applicationChecks.delete(idx);
+  }
+  return false;
+}
+
+function accountNeedsAuthCheck(acc) {
+  return acc.mode === 'oauth' && acc.paused === true
+    && ['auth', 'network_error'].includes(acc.paused_reason) && !hasUnknownApplication(acc);
+}
+
+function authCheckSource(acc) {
+  const recovery = acc.paused_reason === 'network_error' ? acc.network_recovery : null;
+  const value = key => typeof recovery?.[key] === 'string' ? recovery[key] : '';
+  return JSON.stringify([acc.paused_reason, value('reason'), value('last_started_at'), value('next_check_at'), value('last_error')]);
+}
+
+function authCheckBlockReason(acc) {
+  const kind = acc.paused_reason === 'network_error' ? 'Проверка связи' : 'Проверка входа';
+  if (State.lastSnapshot?.paused === true) return 'Включена общая пауза. ' + kind + ' не снимает её и сейчас недоступна.';
+  if (acc.hard_stopped || acc.limit_exceeded) return 'Действует ограничение откликов. ' + kind + ' не отменяет лимиты и сейчас недоступна.';
+  return '';
+}
+
+function renderAuthCheck(acc) {
+  const region = document.getElementById('acc-auth-check-' + acc.idx);
+  if (!region) return;
+  const eligible = accountNeedsAuthCheck(acc);
+  let entry = State.authChecks.get(acc.idx);
+  if (entry && (entry.identity !== applicationCheckIdentity(acc)
+    || (!entry.busy && (!eligible || entry.source !== authCheckSource(acc))))) {
+    State.authChecks.delete(acc.idx);
+    entry = null;
+  }
+  region.hidden = !eligible && !entry;
+  const checking = acc.activity?.phase === 'auth_check';
+  const network = acc.paused_reason === 'network_error';
+  const blocked = authCheckBlockReason(acc);
+  const button = document.getElementById('acc-auth-check-btn-' + acc.idx);
+  if (button) {
+    button.hidden = !eligible;
+    button.disabled = Boolean(entry?.busy) || checking || Boolean(blocked) || !State.ws || State.ws.readyState !== 1;
+    button.textContent = entry?.busy || checking
+      ? (network ? 'Проверяем связь с HH…' : 'Проверяем вход в HH…')
+      : (network ? 'Проверить связь и продолжить' : 'Проверить вход и продолжить');
+    button.title = blocked || 'Свежая проверка связи, входа и доступа к веб-анкете. Отклики не отправляются; другие защитные паузы не снимаются.';
+  }
+  const result = document.getElementById('acc-auth-check-result-' + acc.idx);
+  if (result) result.textContent = blocked || entry?.message || '';
+}
+
+async function recheckAccountAuth(idx) {
+  const acc = State.lastSnapshot?.accounts?.find(a => a.idx === idx);
+  if (!acc || !accountNeedsAuthCheck(acc)) return false;
+  const network = acc.paused_reason === 'network_error';
+  if (!State.ws || State.ws.readyState !== 1) {
+    showCommandError('Нет связи с панелью. Дождитесь свежего состояния перед проверкой доступа к HH.');
+    return false;
+  }
+  const blocked = authCheckBlockReason(acc);
+  if (blocked) {
+    showCommandError(blocked);
+    return false;
+  }
+  if (State.authChecks.get(idx)?.busy || acc.activity?.phase === 'auth_check') return false;
+  const identity = applicationCheckIdentity(acc);
+  const entry = {identity, source: authCheckSource(acc), busy: true,
+    message: network ? 'Проверяем связь и доступ к HH. Отклики не отправляются.'
+      : 'Проверяем вход и доступ к HH. Отклики не отправляются.'};
+  State.authChecks.set(idx, entry);
+  renderAuthCheck(acc);
+  try {
+    const response = await fetch(`/api/account/${idx}/recheck-auth`, {method: 'POST'});
+    const result = await response.json();
+    if (response.ok && result?.ok === true && result.verified === true && result.paused === false) {
+      entry.message = (network ? 'Связь и доступ к HH подтверждены.' : 'Вход в HH подтверждён.')
+        + ' Ожидаем свежий статус панели; остальные ограничения сохраняются.';
+    } else {
+      entry.message = result?.ok === false && typeof result.message === 'string' && result.message.trim()
+        ? result.message.slice(0, 500)
+        : (network ? 'Связь и доступ не подтверждены.' : 'Вход не подтверждён.')
+          + ' Защитная пауза сохранена; отклики не отправлялись.';
+    }
+  } catch (_) {
+    entry.message = network
+      ? 'Результат ручной проверки не получен. Запрос из панели не повторяется; расписание серверных проверок смотрите выше.'
+      : 'Не удалось получить результат проверки входа. Автоматического повтора нет; проверьте связь и свежий статус панели.';
+  } finally {
+    entry.busy = false;
+    const current = State.lastSnapshot?.accounts?.find(a => a.idx === idx);
+    if (State.authChecks.get(idx) === entry && current && applicationCheckIdentity(current) === identity) renderAuthCheck(current);
+    else if (State.authChecks.get(idx) === entry) State.authChecks.delete(idx);
+  }
+  return false;
+}
+
 function updateCard(card, acc) {
+  renderAccountActivity(acc);
+  const pauseInfo = accountPauseInfo(acc, State.lastSnapshot?.paused === true);
   // Status badge — глобальная пауза перекрывает статус
   const badge = document.getElementById('acc-badge-' + acc.idx);
   if (badge) {
@@ -3893,32 +4518,16 @@ function updateCard(card, acc) {
     if (globalPaused) {
       badge.className = 'acc-status-badge status-idle';
       badge.textContent = t('status_all_paused');
-      badge.title = '';
+      badge.title = pauseInfo?.detail || '';
     } else if (accPaused) {
-      const hhUsed = acc.hh_today_applies || 0;
-      const hhLimit = acc.hh_daily_limit || 200;
-      if (acc.hard_stopped && hhUsed >= hhLimit) {
-        badge.className = 'acc-status-badge status-limit';
-        badge.textContent = `🛑 HH-лимит ${hhUsed}/${hhLimit}`;
-        badge.title = `Реальный счётчик из HH (обновлено ${acc.hh_today_applies_updated || '—'}). Авто-сброс при count < ${hhLimit-5}`;
-      } else if (acc.hard_stopped && acc.daily_limit > 0 && acc.daily_sent >= acc.daily_limit) {
-        badge.className = 'acc-status-badge status-limit';
-        badge.textContent = `🛑 ${t('status_daily_limit')} ${acc.daily_sent}/${acc.daily_limit}`;
-        badge.title = t('status_daily_limit_hint');
-      } else if (acc.limit_exceeded) {
-        badge.className = 'acc-status-badge status-limit';
-        badge.textContent = '🚫 ' + t('status_hh_limit');
-        badge.title = acc.status_detail || t('status_hh_limit_hint');
-      } else {
-        badge.className = 'acc-status-badge status-idle';
-        badge.textContent = t('status_acc_paused');
-        badge.title = '';
-      }
+      badge.className = 'acc-status-badge ' + pauseInfo.cls;
+      badge.textContent = pauseInfo.label;
+      badge.title = pauseInfo.detail;
     } else {
       const [icon, labelKey, cls] = STATUS_MAP[acc.status] || ['❓', null, 'status-idle'];
       badge.className = 'acc-status-badge ' + cls;
       badge.textContent = icon + ' ' + (labelKey ? t(labelKey) : acc.status.toUpperCase());
-      if (acc.status_detail) badge.title = acc.status_detail;
+      badge.title = acc.status_detail || '';
     }
   }
 
@@ -4029,9 +4638,9 @@ function updateCard(card, acc) {
   }
 
   // Stats
-  const dailyInfo = acc.daily_limit > 0 ? ` (${acc.daily_sent || 0}/${acc.daily_limit} сегодня)` : (acc.daily_sent ? ` (${acc.daily_sent} сегодня)` : '');
+  setText('acc-daily-' + acc.idx, Number.isSafeInteger(acc.daily_sent) && acc.daily_sent >= 0 ? acc.daily_sent : '—');
   setText('acc-sent-' + acc.idx, acc.sent ?? 0);
-  setText('acc-total-' + acc.idx, (acc.total_applied ?? '') + dailyInfo);
+  setText('acc-total-' + acc.idx, acc.total_applied ?? '—');
   // Real HH count today (из OAuth-tracker, обновляется раз в 30 мин)
   const hhUsed = acc.hh_today_applies || 0;
   const hhLim = acc.hh_daily_limit || 200;
@@ -4044,10 +4653,10 @@ function updateCard(card, acc) {
       const streakHtml = strReq > 0
         ? ` · <span style="color:${strCount >= strReq ? 'var(--green)' : 'var(--dim)'}" title="responses_streak — HH-бейдж 'часто отвечает'">🔥${strCount}/${strReq}</span>`
         : '';
-      hhCell.innerHTML = `HH ${hhUsed}/${hhLim}${streakHtml}`;
+      hhCell.innerHTML = `HH сегодня ${hhUsed}/${hhLim}${streakHtml}`;
       hhCell.style.color = hhUsed >= hhLim ? 'var(--red)' : (hhUsed >= hhLim - 10 ? 'var(--yellow)' : 'var(--dim)');
     } else {
-      hhCell.textContent = 'HH —';
+      hhCell.textContent = 'HH сегодня —';
       hhCell.style.color = 'var(--dim)';
     }
   }
@@ -4171,17 +4780,10 @@ function updateCard(card, acc) {
   // Current vacancy
   const vac = document.getElementById('acc-vacancy-' + acc.idx);
   if (vac) {
-    if (acc.current_vacancy_title) {
-      vac.innerHTML = `
-        <div class="acc-vacancy-title">${esc(acc.current_vacancy_title)}</div>
-        <div class="acc-vacancy-company c-dim">@ ${esc(acc.current_vacancy_company)}</div>
-      `;
-    } else if (acc.status === 'applying') {
-      vac.innerHTML = `<div class="acc-vacancy-title c-dim">${t('card_sending')}</div>`;
-    } else {
-      vac.innerHTML = `<div class="acc-vacancy-title c-dim">${esc(acc.status_detail) || t('card_waiting')}</div>`;
-    }
+    vac.innerHTML = renderAccountVacancy(acc, pauseInfo);
   }
+  renderApplicationCheck(acc);
+  renderAuthCheck(acc);
 
   // Meta
   const meta = document.getElementById('acc-meta-' + acc.idx);
@@ -4293,7 +4895,24 @@ function updateCard(card, acc) {
   const pauseBtn = document.getElementById('acc-pause-btn-' + acc.idx);
   if (pauseBtn) {
     const globalPaused = State.lastSnapshot?.paused;
-    if (globalPaused) {
+    if (acc.paused && hasUnknownApplication(acc)) {
+      pauseBtn.textContent = 'Нужна сверка HH';
+      pauseBtn.classList.add('paused');
+      pauseBtn.disabled = true;
+      pauseBtn.title = 'Обычное продолжение заблокировано: сначала проверьте неизвестный исход отклика в HH.';
+    } else if (acc.paused && acc.paused_reason === 'auth') {
+      pauseBtn.textContent = acc.mode === 'oauth' ? 'Нужна проверка входа' : 'Нужен вход в HH';
+      pauseBtn.classList.add('paused');
+      pauseBtn.disabled = true;
+      pauseBtn.title = acc.mode === 'oauth'
+        ? 'Сначала подтвердите вход в HH кнопкой проверки. Обычное продолжение не снимает защитную паузу.'
+        : 'Восстановите авторизацию этого аккаунта в HH. Обычное продолжение не снимает защитную паузу.';
+    } else if (acc.paused && acc.paused_reason === 'network_error') {
+      pauseBtn.textContent = 'Нужна проверка связи';
+      pauseBtn.classList.add('paused');
+      pauseBtn.disabled = true;
+      pauseBtn.title = 'Сначала нужна проверка связи и доступа к HH. Обычное продолжение не снимает защитную паузу.';
+    } else if (globalPaused) {
       pauseBtn.textContent = t('btn_acc_global_pause');
       pauseBtn.classList.add('paused');
       pauseBtn.disabled = true;
@@ -4309,6 +4928,11 @@ function updateCard(card, acc) {
         pauseBtn.classList.remove('paused');
       }
     }
+  }
+
+  if (pauseBtn && (!State.ws || State.ws.readyState !== 1)) {
+    pauseBtn.disabled = true;
+    pauseBtn.title = 'Нет связи с панелью: команда паузы недоступна';
   }
 
   // LLM toggle button
@@ -4383,6 +5007,11 @@ function updateCard(card, acc) {
   }
   card.querySelectorAll('.smart-filter-cb').forEach(cb => {
     const key = cb.dataset.key;
+    if (key === 'prefer_hh_signals' || key === 'remote_it_only') {
+      cb.disabled = typeof cfg[key] !== 'boolean';
+      cb.title = cb.disabled ? 'Нужен перезапуск бэкенда для новой настройки' : '';
+      if (cb.disabled) cb.checked = false;
+    }
     if (cfg[key] !== undefined) cb.checked = cfg[key];
     if (!cb._bound) {
       cb._bound = true;
@@ -4426,6 +5055,73 @@ function renderGlobalStats(snap) {
   ).join('');
 }
 
+async function checkVacancyContact(idx, button) {
+  const output = document.getElementById(`contact-result-${idx}`);
+  const raw = document.getElementById(`contact-vid-${idx}`)?.value.trim() || '';
+  const match = raw.match(/^(\d{1,20})$/) || raw.match(/^https:\/\/(?:[a-z0-9-]+\.)?hh\.ru\/vacancy\/(\d{1,20})(?:[/?#]|$)/i);
+  if (!output) return;
+  if (!match) { output.textContent = 'Введите ID вакансии или ссылку https://hh.ru/vacancy/…'; return; }
+  button.disabled = true;
+  output.textContent = 'Проверяю опубликованные контакты…';
+  try {
+    const response = await fetch(`/api/account/${idx}/vacancy_contact/${match[1]}`);
+    const data = await response.json();
+    output.textContent = data.message || data.error || 'Данные недоступны';
+    if (data.ok) {
+      const link = document.createElement('a');
+      link.href = `https://hh.ru/vacancy/${match[1]}`;
+      link.target = '_blank';
+      link.rel = 'noopener noreferrer';
+      link.textContent = ' Открыть в HH';
+      output.appendChild(link);
+    }
+  } catch (_) { output.textContent = 'Не удалось проверить контакты. Попробуйте позже.'; }
+  finally { button.disabled = false; }
+}
+
+function renderVacancySignals(meta, showUnknown = false, now = Date.now()) {
+  meta = meta && typeof meta === 'object' ? meta : {};
+  const chips = [];
+  if (meta.observation_unavailable) {
+    chips.push('<span>❔ История новизны недоступна</span>');
+  } else if (meta.publication_updated) {
+    chips.push('<span title="Дата публикации изменилась после нашего наблюдения; резерв новинок не используется">♻️ Дата публикации обновлена</span>');
+  } else if (meta.first_observed_at) {
+    const seen = Date.parse(meta.first_observed_at);
+    if (Number.isFinite(seen)) chips.push(`<span title="Первое наблюдение кликера, не доказательство новой публикации">👁 Впервые замечена: ${esc(new Date(seen).toLocaleString())}</span>`);
+  }
+  const expiry = Date.parse(meta.manager_activity?.is_online_until || '');
+  if (Number.isFinite(expiry) && expiry > now) {
+    chips.push(`<span data-hh-online-until="${expiry}" style="color:var(--green)" title="Присутствие менеджера по данным HH, не гарантия ответа">🟢 Менеджер онлайн</span>`);
+  }
+  const score = meta.skills_match_percent;
+  if (typeof score === 'number' && Number.isFinite(score) && score >= 0 && score <= 100) {
+    chips.push(`<span title="Совпадение навыков по данным HH, не вероятность приглашения">🧩 Навыки ${Math.round(score)}%</span>`);
+  }
+  const names = {
+    got_response: 'Уже есть отклик в HH', got_invitation: 'Приглашение в HH',
+    got_rejection: 'Отказ в HH', favorited: 'В избранном HH', blacklisted: 'Скрыта в HH'
+  };
+  for (const relation of new Set(Array.isArray(meta.relations) ? meta.relations : [])) {
+    if (Object.prototype.hasOwnProperty.call(names, relation)) {
+      chips.push(`<span title="Статус аккаунта в HH; может относиться к другому резюме">${names[relation]}</span>`);
+    }
+  }
+  return chips.join(' · ') || (showUnknown ? '<span class="c-dim">HH: нет доступных сигналов</span>' : '');
+}
+
+function expireVacancyOnlineSignals() {
+  const now = Date.now();
+  document.querySelectorAll('[data-hh-online-until]').forEach(el => {
+    if (Number(el.dataset.hhOnlineUntil) <= now) {
+      el.textContent = 'Онлайн-статус HH устарел';
+      el.style.color = 'var(--dim)';
+      el.removeAttribute('data-hh-online-until');
+    }
+  });
+}
+setInterval(expireVacancyOnlineSignals, 1000);
+
 function renderRecentResponses(snap) {
   const list = document.getElementById('recent-list');
   if (!list) return;
@@ -4442,8 +5138,10 @@ function renderRecentResponses(snap) {
     const title = r.title ? r.title.substring(0, 35) + (r.title.length > 35 ? '…' : '') : `ID:${r.id}`;
     // HR online / chat status chips — данные пришли с бэка в vacancy_meta.
     const chips = [];
-    if (r.hr_online === 'online') {
-      chips.push('<span style="color:var(--green);font-size:10px" title="HR онлайн прямо сейчас">🟢</span>');
+    const hhSignals = renderVacancySignals(r);
+    if (hhSignals) chips.push(hhSignals);
+    if (r.hr_online === 'online' && !r.manager_activity?.is_online_until) {
+      chips.push('<span style="color:var(--dim);font-size:10px" title="HR был онлайн при проверке; текущий статус неизвестен">🟢</span>');
     } else if (r.hr_online === 'offline') {
       chips.push('<span style="color:var(--dim);font-size:10px" title="HR offline">⚫</span>');
     }
@@ -5385,6 +6083,9 @@ async function applyCheck() {
       applyShowResult(`🔄 ${data.message}`, 'warn');
     } else if (data.status === 'limit') {
       applyShowResult(`🚫 ${data.message}`, 'err');
+    } else if (data.status === 'unknown' || data.status === 'cancelled') {
+      applyShowResult(`⚠️ ${data.message}`, 'warn');
+      applyHideQuestionnaire();
     } else if (data.status === 'test_required') {
       ApplyState.questions = data.questions || [];
       applyShowResult(
@@ -5514,6 +6215,9 @@ async function applySubmit() {
       applyHideQuestionnaire();
     } else if (data.status === 'limit') {
       applyShowResult(`🚫 ${data.message}`, 'err');
+    } else if (data.status === 'unknown' || data.status === 'cancelled') {
+      applyShowResult(`⚠️ ${data.message}`, 'warn');
+      applyHideQuestionnaire();
     } else {
       applyShowResult(`❌ ${data.message}`, 'err');
     }

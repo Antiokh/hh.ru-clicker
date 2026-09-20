@@ -129,11 +129,13 @@ def _async_value(value):
 def bot_stub(monkeypatch):
     """Подменяет bot-хелперы и add_applied шпионами (без диска и реального bot'а)."""
     acc = dict(ACC)
-    state = types.SimpleNamespace(sent=0, questionnaire_sent=0, short="a1", color="green")
+    from app.state import AccountState
+    state = AccountState({**acc, "short": "a1", "color": "green", "urls": []})
     logs: list = []
     applied: list = []
     monkeypatch.setattr(bot, "_get_apply_acc", lambda idx: dict(acc))
     monkeypatch.setattr(bot, "_get_apply_state", lambda idx: state)
+    monkeypatch.setattr(bot, "_persist_pauses", lambda: None)
     monkeypatch.setattr(
         bot, "_add_log",
         lambda short, color, msg, level="info", neg_id="": logs.append((short, color, msg, level)),
@@ -375,7 +377,7 @@ def _fake_aiohttp(get_response, post_response):
 
 
 @pytest.mark.parametrize("post_status,location,expected", [
-    (302, "/applicant/negotiations", "sent"),
+    (302, "/applicant/negotiations", "unknown"),
     (302, "/negotiations-limit-exceeded", "limit"),
     (302, "/applicant/vacancy_response?vacancyId=777&withoutTest=no", "error"),
     (400, "", "error"),
@@ -393,6 +395,10 @@ def test_real_web_form_outcomes(monkeypatch, bot_stub, post_status, location, ex
         assert bot_stub["state"].sent == 1
         assert bot_stub["state"].questionnaire_sent == 1
         assert bot_stub["applied"] == [("acc1", "777")]
+
+    if expected == "unknown":
+        assert bot_stub["state"].sent == 0
+        assert bot_stub["applied"] == []
 
 
 def test_submit_validation_errors(monkeypatch, bot_stub):

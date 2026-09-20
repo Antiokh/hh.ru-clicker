@@ -832,6 +832,8 @@ def _edit_resume_field(acc: dict, resume_hash: str, fields: dict) -> dict:
             cookies=acc.get("cookies", {}), timeout=10,
         )
         # POST edit
+        from app.mutation_safety import ensure_mutation_allowed
+        ensure_mutation_allowed(acc)
         r = HH.post(
             f"{hh_base()}/applicant/resume/edit?resume={resume_hash}&hhtmSource=resume_partial_edit",
             headers={
@@ -877,6 +879,8 @@ def set_job_search_status(acc: dict, status: str) -> dict:
     ua = webview_user_agent()
     xsrf = (acc.get("cookies") or {}).get("_xsrf", "")
     try:
+        from app.mutation_safety import ensure_mutation_allowed
+        ensure_mutation_allowed(acc)
         r = HH.put(
             f"{hh_base()}/shards/user_statuses/job_search_status",
             params={"status": status},

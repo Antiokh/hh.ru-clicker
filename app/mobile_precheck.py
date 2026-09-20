@@ -95,12 +95,15 @@ def check_vacancy_before_apply(acc: dict, vacancy_id, resume_id: str = "",
         log_debug(f"mobile check_vacancy_before_apply vacancy={vacancy_id}: "
                   f"пустое тело -> fail-closed")
         return {"ok": False, "missing": [], "reason": "empty_response"}
-    raw = data.get("data_inconsistency") if isinstance(data, dict) else None
+    if (not isinstance(data, dict) or "data_inconsistency" not in data
+            or not isinstance(data["data_inconsistency"], (list, dict))):
+        return {"ok": False, "missing": [], "reason": "invalid_response"}
+    raw = data["data_inconsistency"]
     missing = _parse_missing(raw)
     if missing:
         log_debug(f"mobile check_vacancy_before_apply vacancy={vacancy_id}: "
                   f"не хватает {missing} -> отклик пропускается")
     hard_missing = [item for item in missing if item in HARD_MISSING]
     soft_missing = [item for item in missing if item not in HARD_MISSING]
-    return {"ok": not hard_missing, "hard_missing": hard_missing,
+    return {"ok": not hard_missing, "resume_id": resume_id, "hard_missing": hard_missing,
             "soft_missing": soft_missing}

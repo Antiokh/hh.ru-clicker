@@ -82,7 +82,7 @@ class WebHHClient(HHClient):
     def check_vacancy_before_apply(self, vid: str) -> dict:
         return hh_apply._check_vacancy_before_apply(self.acc, vid)
 
-    def check_limit(self) -> bool:
+    def check_limit(self) -> bool | None:
         return hh_apply.check_limit(self.acc)
 
     def touch_resume(self) -> tuple:
@@ -150,6 +150,6 @@ class WebHHClient(HHClient):
     def fetch_employer_rating_oauth(self, employer_id: str) -> dict:
         return oauth.fetch_employer_rating(self.acc, employer_id)
     def search_vacancies(self, text: str, area_id=113, per_page: int = 20,
-                         page: int = 0, filters=None, max_pages: int = 20) -> list:
+                         page: int = 0, filters=None, max_pages: int = 100) -> list:
         return hh_api.fetch_hh_vacancies(
             self.acc, text, area_id, per_page, page, filters, max_pages)

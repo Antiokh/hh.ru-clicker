@@ -210,14 +210,14 @@ def web_mode(monkeypatch):
 #popup-ответ с shortVacancy: статус 200 → роут вернёт "sent" (уже отправлен)
 _POPUP_SENT = _StubResponse(
     200,
-    '{"responseStatus": {"shortVacancy": {"name": "Dev", "company": {"name": "Co"}}}}',
+    '{"success":true,"responseStatus": {"shortVacancy": {"name": "Dev", "company": {"name": "Co"}}}}',
 )
 # popup со ссылкой на опрос: НЕ 200 (200 → ветка "sent") и не 401/403 (auth)
 _POPUP_TEST_REQUIRED = _StubResponse(400, '<div class="test-required">пройдите опрос</div>')
 # HTML формы опросника: без вопросов, не login-страница
 _FORM_HTML = _StubResponse(200, '<html><form><input type="hidden" name="_xsrf" value="tok1"></form></html>')
 # 302 на переговоры → успешный submit
-_SUBMIT_REDIRECT = _StubResponse(302, "", headers={"location": "/applicant/negotiations"})
+_SUBMIT_REDIRECT = _StubResponse(200, '{"success":true,"topic_id":"1"}')
 
 
 # ── 1. /api/apply/check: POST popup уходит через http-прокси ─────────────────

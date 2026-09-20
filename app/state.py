@@ -3,12 +3,14 @@ AccountState — per-account state object for the bot.
 """
 
 import random
+import copy
 import threading
 from datetime import datetime, timedelta
 from collections import deque
 
 from app.config import CONFIG
 from app.storage import count_applied_on_day
+from app.account_activity import initial_activity
 
 
 class AccountState:
@@ -26,6 +28,16 @@ class AccountState:
 
         self.status = "idle"
         self.status_detail = ""
+        self.activity = initial_activity()
+        self.activity_pause_started_at = None
+        self.receipt_check_started_at = None
+        self._reconcile_persistence_failed = False
+        # Per-cycle observations are deliberately not restored from day totals.
+        self._cycle_report = None
+        self._cycle_universe = None
+        self._cycle_considered = set()
+        self._cycle_outcomes = {}
+        self._cycle_questionnaires = set()
 
         self.sent = 0
         self.tests = 0
@@ -43,6 +55,7 @@ class AccountState:
         self.total_urls = len(acc_data["urls"])
 
         self.current_vacancy_title = ""
+        self.current_vacancy_id = ""
         self.current_vacancy_company = ""
         self.current_vacancy_idx = 0
         self.total_vacancies = 0
@@ -50,7 +63,7 @@ class AccountState:
         self.vacancies_by_url = {}
         self.vacancies_queue = []
 
-        self.limit_exceeded = False
+        self.limit_exceeded = acc_data.get("limit_exceeded") is True
         self.limit_reset_time = None
 
         self.use_oauth = bool(acc_data.get("use_oauth", False))  # per-account OAuth toggle
@@ -70,7 +83,7 @@ class AccountState:
             self.daily_sent = count_applied_on_day(self.name, self.daily_date)
         except Exception:
             pass
-        self.hard_stopped = False  # жёсткая остановка (лимит или daily)
+        self.hard_stopped = acc_data.get("hard_stopped") is True
 
         self.resume_touch_enabled = True
         # Startup jitter: первый touch отсрочен на 0-120s, чтобы 100 аккаунтов
@@ -122,7 +135,7 @@ class AccountState:
         self.resume_view_history: list = []   # [{employer_id, name, date, vacancy}]
 
         # Per-account pause (new for web dashboard)
-        self.paused = False
+        self.paused = acc_data.get("paused") is True
         self._deleted = False  # Set True to stop worker thread
 
         # Per-account event log (last 8 events shown on card)
@@ -177,6 +190,7 @@ class AccountState:
         self._llm_temp_skip: dict = {}       # {(neg_id, last_msg_id): expiry_ts} — transient failure, retry after TTL
         self._llm_no_chat: set = set()       # {neg_id} chats that returned 409 (permanently closed/locked)
         self._llm_drafts: dict = {}          # {(neg_id, last_msg_id): reply_text} — кэш сгенерированных черновиков
+        self._llm_robot_drafts: set = set()  # Separate from sendable text drafts: workflow buttons are actions.
         self._llm_drafts_lock = threading.Lock()  # WS-поток edit-invalidate vs LLM-поток write — гоняются
                                               # на сессию воркера. Если auto_send позже включится — отправляем
                                               # сохранённый текст без повторного LLM-вызова. Сбрасывается
@@ -213,7 +227,29 @@ class AccountState:
         # мог найти его без знания о AccountState.
         self.acc["_cookies_lock"] = self._cookies_lock
         # Reason for pause — manual vs auto vs limit — чтобы midnight reset не сбрасывал manual pause.
-        self.paused_reason: str = ""  # "", "manual", "auto_errors", "limit"
+        self.paused_reason: str = str(acc_data.get("paused_reason") or "manual") if self.paused else ""
+        # An unconfirmed write is not a user pause. Keep every in-flight result
+        # from a batch until its exact vacancy/resume receipt is reconciled.
+        pending = acc_data.get("pending_applies")
+        if not isinstance(pending, list):
+            pending = [acc_data["pending_apply"]] if isinstance(acc_data.get("pending_apply"), dict) else []
+        self.pending_applies: list = copy.deepcopy(pending)
+        self.pending_apply = self.pending_applies[0] if self.pending_applies else None
+        if self.pending_applies or acc_data.get("paused_reason") == "outcome_unknown":
+            self.paused = True
+            self.paused_reason = "outcome_unknown"
+        # Restored pauses have no known start time unless the pending receipt
+        # carries one. A later real transition is timestamped by note_pause.
+        self._activity_pause_key = (self.paused, self.paused_reason, self.hard_stopped, self.limit_exceeded)
+        self._activity_control_revision = 0
+        self.auth_check_started_at = None
+        self._auth_recovery_pending = False
+        recovery = acc_data.get("network_recovery")
+        self.network_recovery = copy.deepcopy(recovery) if isinstance(recovery, dict) else None
+        self._network_error_streak = 0
+        self._network_error_last_count = 0
+        self._network_recovery_persistence_failed = False
+
 
     def reset_vacancy_meta(self):
         """Clear vacancy_meta before each collection cycle to prevent unbounded growth."""

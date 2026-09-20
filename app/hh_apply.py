@@ -13,6 +13,7 @@ from glom import glom
 from app.logging_utils import log_debug, _is_login_page
 from app.config import CONFIG, hh_base
 from app.hh_http import HH
+from app.mutation_safety import ensure_mutation_allowed, MutationBlocked, OutcomeUnknown
 # Egress-helpers aiohttp переехали в app/hh_http.py (единая точка egress);
 # реэкспорт для совместимости — routes/apply.py и тесты импортируют отсюда.
 from app.hh_http import _aio_proxy, _aio_session_connector, _aio_egress_kwargs  # noqa: F401
@@ -76,6 +77,8 @@ def classify_apply_response(status_code: int, txt: str) -> tuple:
     4. 200 + success-маркер → sent
     5. всё остальное → error
     """
+    if status_code >= 500:
+        return "unknown", {"http_status": status_code}
     if status_code in (401, 403):
         return "auth_error", {}
 
@@ -84,6 +87,7 @@ def classify_apply_response(status_code: int, txt: str) -> tuple:
 
     info = {}
     parsed = None
+    txt = txt.lstrip()
     if txt.startswith("{"):
         try:
             parsed = json.loads(txt)
@@ -142,14 +146,18 @@ def classify_apply_response(status_code: int, txt: str) -> tuple:
             return "limit", info
 
         # Теперь успех: новый формат top-level success/topic_id
+        if not 200 <= status_code < 300:
+            return "error", {"http_status": status_code, **info}
         top_success = parsed.get("success")
-        if top_success in (True, "true", "True") or parsed.get("topic_id"):
+        if top_success in (True, "true", "True") or parsed.get("topic_id") or parsed.get("status") == "ok":
             info["topic_id"] = parsed.get("topic_id", "")
             info["chat_id"] = parsed.get("chat_id", "")
             return "sent", info
         if rs.get("responded") is True or rs.get("success") is True:
             return "sent", info
-        # JSON распарсен но никаких флагов — fallthrough к substring fallback.
+        # A parsed false flag (or a marker inside descriptive text) is not a
+        # refusal. Substring matching is only for genuinely non-JSON bodies.
+        return "unknown", {"reason": "unconfirmed_response", **info}
 
     # ── 3. Substring fallback для не-JSON ответов (HTML страница и т.п.) ──
     if "negotiations-limit-exceeded" in txt:
@@ -159,20 +167,8 @@ def classify_apply_response(status_code: int, txt: str) -> tuple:
     if "alreadyApplied" in txt:
         return "already", info
 
-    if status_code == 200:
-        if ('"success":true' in txt or '"success":"true"' in txt
-                or '"status":"ok"' in txt or '"responded":true' in txt
-                or "shortVacancy" in txt or "topic_id" in txt):
-            return "sent", info
-        # HH иногда отдаёт 200 + HTML SPA-страницу редиректа (например на
-        # /vacancy/{id} после успешного отклика) без JSON-маркеров. Если
-        # тело большое (>2KB HTML) и НЕ содержит явных ошибок — trust'им,
-        # 200 от popup submit без 4xx-error = отклик прошёл.
-        if len(txt) > 2000 and ("<!doctype" in txt[:200].lower() or "<html" in txt[:200].lower()):
-            if not any(m in txt for m in ('"error"', 'test-required', 'already-applied',
-                                          'negotiations-limit', 'SPAM_DETECTED', 'captcha')):
-                return "sent", info
-        return "error", {"raw": txt[:200], **info}
+    if 200 <= status_code < 300:
+        return "unknown", {"reason": "unconfirmed_response", **info}
 
     if status_code in (502, 503, 504):
         return "error", {"raw": txt[:200], "transient": True, **info}
@@ -197,6 +193,7 @@ async def generate_hh_ai_letter(acc: dict, resume_hash: str, vid: str, timeout_s
         return ""
     headers = get_headers(xsrf)
     try:
+        ensure_mutation_allowed(acc)
         r = await _asyncio.to_thread(
             HH.post,
             f"{hh_base()}/shards/hhpro_ai_letter",
@@ -251,6 +248,9 @@ async def send_response_async(acc: dict, vid: str, letter_max_length: int | None
     Если `CONFIG.hh_ai_letter_first_try` включен и у нас ещё есть бесплатная попытка
     (сервер даст 1 раз на пару resumeHash×vacancyId) — берём письмо от HH-AI.
     """
+    from app.apply_quarantine import blocked
+    if blocked(acc, vid):
+        raise MutationBlocked('Повтор неподтверждённого отклика заблокирован')
     log_debug(f"📤 ОТПРАВКА ОТКЛИКА на вакансию {vid} | Аккаунт: {acc['name']}")
 
     xsrf = acc.get("cookies", {}).get("_xsrf", "")
@@ -283,6 +283,7 @@ async def send_response_async(acc: dict, vid: str, letter_max_length: int | None
         # http(s) → proxy= на запрос (см. _aio_egress_kwargs).
         sess_kw, req_kw = _aio_egress_kwargs()
         async with aiohttp.ClientSession(headers=headers, cookies=acc["cookies"], **sess_kw) as session:
+            ensure_mutation_allowed(acc)
             async with session.post(
                 hh_base() + "/applicant/vacancy_response/popup",
                 data=data,
@@ -299,17 +300,61 @@ async def send_response_async(acc: dict, vid: str, letter_max_length: int | None
             # Диагностика: HTML-редирект после отклика — что там?
             log_debug(f"   200 (не-JSON, {len(txt)}b): {txt[:200]}")
         return classify_apply_response(status_code, txt)
+    except MutationBlocked:
+        return "cancelled", {}
     except Exception as e:
-        return "error", {"exception": str(e)}
+        return "unknown", {"exception": str(e)}
 
 
 async def fill_and_submit_questionnaire(acc: dict, vid: str,
-                                        vacancy_title: str = "", company: str = "") -> tuple:
+                                        vacancy_title: str = "", company: str = "", *,
+                                        receipt_account: dict | None = None) -> tuple:
     """
     Получает страницу опроса, заполняет шаблонными ответами и отправляет.
     Поддерживает textarea, radio, checkbox.
     Возвращает (result, info): result = sent | limit | test | error
     """
+    from app.apply_quarantine import blocked
+    if blocked(receipt_account or acc, vid):
+        raise MutationBlocked('Повтор неподтверждённого отклика заблокирован')
+    resume_id = str(acc.get("_pinned_resume_id") or acc.get("resume_hash") or "")
+    source_account = acc if receipt_account is None else receipt_account
+    dispatched = False
+    dispatched_at = None
+    confirmation_attempted = False
+    confirmation_result = ("unknown", {"error_code": "submission_unconfirmed"})
+
+    async def unconfirmed():
+        # A redirect/timeout is not an ACK. Reconcile once with a fresh read;
+        # never repeat the questionnaire POST, even if this read also fails.
+        from app.apply_confirmation import confirm_application_receipt
+        import asyncio
+        from datetime import datetime
+        nonlocal confirmation_attempted, confirmation_result
+        if confirmation_attempted:
+            return confirmation_result
+        confirmation_attempted = True
+        try:
+            receipt = await asyncio.to_thread(
+                confirm_application_receipt, source_account, str(vid), resume_id)
+        except Exception:
+            receipt = None
+        if receipt is not None:
+            # Existence is enough to prevent a duplicate POST, but only a new
+            # receipt may increment today's applications. Missing/old dates
+            # mean already applied, never a newly confirmed send.
+            fresh = False
+            try:
+                created = datetime.fromisoformat(receipt["receipt_created_at"])
+                fresh = (created.tzinfo is not None and dispatched_at is not None and
+                         dispatched_at - 5 <= created.timestamp() <= time.time() + 5)
+            except (KeyError, TypeError, ValueError, OverflowError):
+                pass
+            confirmation_result = ("sent" if fresh else "already", receipt)
+        return confirmation_result
+
+    if not resume_id:
+        return "error", {"error_code": "resume_required"}
     headers_get = {
         "User-Agent": webview_user_agent(),
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
@@ -436,7 +481,7 @@ async def fill_and_submit_questionnaire(acc: dict, vid: str,
 
             # Шаг 2: POST данные
             data = aiohttp.FormData()
-            data.add_field("resume_hash", acc["resume_hash"])
+            data.add_field("resume_hash", resume_id)
             data.add_field("vacancy_id", vid)
             data.add_field("letter", _randomize_text(acc.get("letter", "")))
             data.add_field("lux", "true")
@@ -454,6 +499,9 @@ async def fill_and_submit_questionnaire(acc: dict, vid: str,
                     data.add_field(name, str(value))
 
             # Шаг 3: POST
+            ensure_mutation_allowed(acc)
+            dispatched_at = time.time()
+            dispatched = True
             async with session.post(
                 url_form,
                 headers={"X-Xsrftoken": acc.get("cookies", {}).get("_xsrf", ""), "Referer": url_form},
@@ -478,25 +526,27 @@ async def fill_and_submit_questionnaire(acc: dict, vid: str,
                 if "withoutTest=no" in location or f"vacancyId={vid}" in location:
                     log_debug(f"Questionnaire {vid}: form rejected, redirect back")
                     return "test", {}
-                return "error", {"error_code": "submission_unconfirmed"}
+                return await unconfirmed()
 
             if status == 200:
-                if "negotiations-limit-exceeded" in txt:
-                    return "limit", {}
-                if "test-required" in txt:
-                    return "test", {}
                 # HTML 200 can be a validation error or captcha. Only explicit
                 # structured success is sufficient to update application counts.
                 result, info = classify_apply_response(status, txt)
-                if result == 'sent' and txt.lstrip().startswith('{'):
+                if result in ('sent', 'limit', 'test', 'already', 'auth_error', 'error'):
                     return result, info
-                return "error", {"error_code": "submission_unconfirmed"}
+                return await unconfirmed()
 
+            if status >= 500:
+                return await unconfirmed()
             return "test", {}
 
+    except MutationBlocked:
+        return "cancelled", {}
     except Exception as e:
         log_debug(f"fill_and_submit_questionnaire error: {e}")
-        return "error", {"exception": str(e)}
+        if dispatched:
+            return await unconfirmed()
+        return "error", {"error_code": "questionnaire_fetch_failed"}
 
 
 def _check_vacancy_before_apply(acc: dict, vid: str) -> dict:
@@ -623,7 +673,9 @@ def check_limit(acc: dict) -> bool:
             ),
             retries=3, backoff_base=2.0,
         )()
-        return "negotiations-limit-exceeded" in r.text
+        if "negotiations-limit-exceeded" in r.text:
+            return True
+        return None  # Absence of the marker does not prove quota recovery.
     except Exception:
         return True
 
@@ -650,6 +702,7 @@ def touch_resume(acc: dict) -> tuple:
     headers = get_headers(xsrf)
 
     try:
+        ensure_mutation_allowed(acc)
         r = HH.post(
             hh_base() + "/shards/resume/batch_update",
             headers=headers,
@@ -671,12 +724,16 @@ def touch_resume(acc: dict) -> tuple:
                 log_debug("batch_update: сервер отдал hhcaptcha/recaptcha isBot=true")
             else:
                 return True, "Резюме подняты (batch_update)"
+        elif r.status_code >= 500:
+            raise OutcomeUnknown("Поднятие резюме не подтверждено")
         elif r.status_code == 429:
             return False, "Слишком часто (429)"
         else:
             log_debug(f"batch_update HTTP {r.status_code}, пробую /applicant/resumes/touch")
+    except (MutationBlocked, OutcomeUnknown):
+        raise
     except Exception as e:
-        log_debug(f"batch_update exception: {e}, пробую /applicant/resumes/touch")
+        raise OutcomeUnknown("Поднятие резюме не подтверждено") from e
 
     resume_hash = acc["resume_hash"]
     touch_files = {
@@ -684,6 +741,7 @@ def touch_resume(acc: dict) -> tuple:
         "undirectable": (None, "true"),
     }
     try:
+        ensure_mutation_allowed(acc)
         response = _with_retry(
             lambda: HH.post(
                 hh_base() + "/applicant/resumes/touch",
@@ -693,18 +751,22 @@ def touch_resume(acc: dict) -> tuple:
                 files=touch_files,
                 timeout=_HH_DEFAULT_TIMEOUT,
             ),
-            retries=3, backoff_base=2.0,
+            retries=0, backoff_base=2.0,
         )()
 
         if response.status_code == 200:
             return True, "Резюме поднято (web)!"
+        elif response.status_code >= 500:
+            raise OutcomeUnknown("Поднятие резюме не подтверждено")
         elif response.status_code == 429:
             return False, "Слишком часто (429)"
         else:
             return False, msg or f"HTTP {response.status_code}"
 
+    except (MutationBlocked, OutcomeUnknown):
+        raise
     except Exception as e:
-        return False, msg or f"Ошибка: {str(e)[:30]}"
+        raise OutcomeUnknown("Поднятие резюме не подтверждено") from e
 
 
 def fetch_related_vacancies(acc: dict, seed_vid: str, max_pages: int = 1) -> list:

@@ -5,14 +5,17 @@ BotManager — core bot logic with per-account worker threads.
 import asyncio
 import aiohttp
 import json
+import hashlib
 import random
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from collections import deque
+from contextlib import nullcontext
 from pathlib import Path
 import time
 import threading
 import requests
 import urllib.parse
+from types import SimpleNamespace
 from app.hh_http import HH
 from app.user_agent import mobile_user_agent, webview_user_agent
 try:
@@ -22,9 +25,14 @@ except Exception:
     _MSK = None  # fallback на local
 
 from app.logging_utils import log_debug, log_exception, _is_login_page
+from app.vacancy_signals import normalize_vacancy_signals, vacancy_signal_priority
+from app.vacancy_salary import salary_for_ruble_threshold
+from app.mutation_safety import MutationBlocked, ensure_mutation_allowed
+from app.search_scope import remote_it_filters, remote_it_url, remote_it_rejection, scope_metadata
+from app.apply_quarantine import blocked as quarantine_blocked
 
 
-def parse_search_url(url: str) -> tuple[str, int | str, dict]:
+def parse_search_url(url: str) -> tuple[str, int | str | list[str] | None, dict]:
     """Convert an HH web/API search URL to ``search_vacancies`` arguments."""
     query = urllib.parse.parse_qs(
         urllib.parse.urlparse(url).query, keep_blank_values=False
@@ -35,12 +43,13 @@ def parse_search_url(url: str) -> tuple[str, int | str, dict]:
         return values[-1] if values else default
 
     text = _take("text", "")
-    # HH area 113 = вся Россия. Ссылки без явного area (в частности старые
-    # автоссылки по resume) не должны молча ограничиваться Москвой (area=1).
-    area = _take("area", 113)
+    # Missing area means no country/region restriction, as in the HH API.
+    # Do not silently turn a worldwide search into Russia-only (113).
+    areas = query.pop("area", [])
+    area = areas if len(areas) > 1 else (areas[0] if areas else None)
     # Pagination is controlled by the collector/mobile client.  These keys are
     # properties of the SSR URL, not vacancy filters.
-    for key in ("page", "per_page", "items_on_page", "no_magic", "ored_clusters"):
+    for key in ("page", "per_page", "items_on_page", "ored_clusters"):
         query.pop(key, None)
     filters = {
         key: values[0] if len(values) == 1 else values
@@ -57,6 +66,19 @@ def _mobile_search_filters(filters: dict) -> dict:
     locally sorted result can still miss the globally newest vacancies.
     """
     result = dict(filters or {})
+    if CONFIG.remote_it_only:
+        result = remote_it_filters(result)
+    labels = result.get("label", [])
+    labels = list(labels) if isinstance(labels, (list, tuple)) else [labels]
+    if CONFIG.filter_agencies:
+        labels.append("not_from_agency")
+    if CONFIG.filter_low_competition:
+        labels.append("low_performance")
+    labels = list(dict.fromkeys(label for label in labels if label))
+    if labels:
+        result["label"] = labels[0] if len(labels) == 1 else labels
+    if CONFIG.prefer_hh_signals:
+        result["with_skills_match"] = "true"
     if CONFIG.fresh_vacancies_mode:
         result.setdefault("order_by", "publication_time")
     try:
@@ -77,6 +99,12 @@ def _uses_api_search(acc: dict, state) -> bool:
         and acc.get("resume_hash")
         and state.degraded_fallback_enabled
     )
+
+
+def _current_vacancy_signals(state) -> dict:
+    meta = state.vacancy_meta.get(getattr(state, "current_vacancy_id", ""), {})
+    return {key: meta.get(key) for key in (
+        "manager_activity", "skills_match_percent", "relations", "first_observed_at", "publication_updated", "observation_unavailable")}
 
 
 def _server_next_publish_datetime(status: dict) -> datetime | None:
@@ -111,7 +139,14 @@ def _vacancy_published_at(meta: dict) -> datetime | None:
 
 
 def _is_fresh_vacancy(meta: dict, hours: int, now: datetime | None = None) -> bool:
+    if meta.get("observation_unavailable") or meta.get("publication_updated"):
+        return False
     published = _vacancy_published_at(meta)
+    from app.vacancy_history import timestamp
+    first = timestamp(meta.get("first_observed_at"))
+    earliest = timestamp(meta.get("earliest_published_at"))
+    if published and published.tzinfo:
+        published = min(x for x in (published, first, earliest) if x)
     if published is None or bool((meta or {}).get("archived")):
         return False
     if now is None:
@@ -235,6 +270,9 @@ from app.hh_resume import (
 )
 
 from app.state import AccountState
+from app.account_activity import activity_view, set_activity, note_pause, aware_iso
+from app.cycle_report import (begin_cycle, found_cycle, consider_cycle, cycle_outcome,
+    questionnaire_cycle, cycle_operation_error, finish_cycle, resolve_cycle_unknown, cycle_snapshot)
 
 LLM_LOG_FILE = Path("data") / "llm_log.jsonl"
 
@@ -277,7 +315,7 @@ def _handle_edited_event(state, payload: dict) -> None:
 
 class BotManager:
     def __init__(self):
-        self.paused = False
+        self.paused = CONFIG.automation_paused
         self._stop_event = threading.Event()
         self.account_states: list[AccountState] = []
         self.activity_log: deque = deque(maxlen=100)
@@ -300,9 +338,646 @@ class BotManager:
         self._hr_contacts_lock = threading.Lock()
         # Guards activate_session against concurrent WS calls spawning duplicate workers
         self._activate_lock = threading.Lock()
+        self._pause_persist_lock = threading.Lock()
         self._retiring_sessions = []  # (session object, state), until workers exit
         # Сериализация append к data/llm_log.jsonl (kimi-search-1 #5).
         self._llm_log_write_lock = threading.Lock()
+
+    def _can_mutate(self, state, *, llm=False):
+        stop = getattr(self, "_stop_event", None)
+        return not (
+            (stop is not None and stop.is_set()) or getattr(self, "paused", False)
+            or state.paused or state._deleted or getattr(state, "hard_stopped", False)
+            or getattr(state, "pending_apply", None)
+            or getattr(state, "_auth_recovery_pending", False)
+            or (llm and (not state.llm_enabled or not CONFIG.llm_enabled or not CONFIG.llm_auto_send))
+        )
+
+    def _bind_mutation_guard(self, state):
+        state.acc["_mutation_guard"] = lambda: self._can_mutate(state)
+
+    @staticmethod
+    def _activity_vacancy(state, vacancy_id=None):
+        """Presentation only: a batch has no single current vacancy."""
+        with state._state_lock:
+            meta = state.vacancy_meta.get(str(vacancy_id), {}) if vacancy_id else {}
+            state.current_vacancy_id = str(vacancy_id) if vacancy_id else ""
+            state.current_vacancy_title = str(meta.get("title") or "")
+            state.current_vacancy_company = str(meta.get("company") or "")
+
+    def _persist_pauses(self, *, wait=False):
+        # Serialize the entire capture + queue/barrier sequence. setdefault
+        # supports intentionally minimal __new__ test/manually built managers.
+        lock = self.__dict__.setdefault("_pause_persist_lock", threading.Lock())
+        with lock:
+            self._persist_pauses_locked(wait=wait)
+
+    def _persist_pauses_locked(self, *, wait=False):
+        def snapshot(state):
+            note_pause(state)
+            return {**{k: getattr(state, k) for k in
+                       ("paused", "paused_reason", "hard_stopped", "limit_exceeded")},
+                    "pending_apply": dict(state.pending_apply) if state.pending_apply else None,
+                    "pending_applies": [dict(item) for item in state.pending_applies],
+                    "network_recovery": dict(state.network_recovery) if getattr(state, "network_recovery", None) else None}
+        for state in getattr(self, "account_states", []):
+            with state._state_lock:
+                state.acc.update(snapshot(state))
+        for idx, state in list(getattr(self, "temp_states", {}).items()):
+            sessions = getattr(self, "temp_sessions", [])
+            if idx < len(sessions):
+                with state._state_lock:
+                    captured = snapshot(state)
+                    state.acc.update(captured)
+                    sessions[idx].update(captured)
+        # A stopped worker may receive an ambiguous ACK while it is retiring.
+        # Activation waits for that worker; do not lose its protective state.
+        for session, state in getattr(self, "_retiring_sessions", []):
+            if any(session is item for item in getattr(self, "temp_sessions", [])):
+                with state._state_lock:
+                    session.update(snapshot(state))
+        # File I/O may block. Never hold an account lock while waiting for it.
+        if wait:
+            save_accounts(wait=True)
+        else:
+            save_accounts()
+        save_browser_sessions(getattr(self, "temp_sessions", []), wait=True)
+
+    @staticmethod
+    def _pause_detail(state):
+        if state.paused_reason == "outcome_unknown" or state.pending_apply:
+            return "Исход отклика неизвестен. Нужна сверка в HH; повторная отправка заблокирована"
+        return {
+            "manual": "Пауза пользователем",
+            "auth": "Пауза: требуется восстановить авторизацию HH",
+            "hh_rate_limit": "HH ограничил запросы к анкете. Автоматические попытки остановлены",
+            "challenge": "HH ограничил доступ к веб-анкете. Требуется ручная проверка",
+            "auto_errors": "Защитная пауза: несколько ошибок подряд; нужна проверка подключения",
+            "network_error": "Сетевая пауза: веб-анкеты не отправлены. Проверка соединения без повторной отправки",
+            "message_outcome_unknown": "Результат сообщения неизвестен. Проверьте чат HH перед продолжением",
+            "limit": "Пауза: достигнут лимит откликов",
+        }.get(state.paused_reason, "Автоматизация приостановлена")
+
+    @staticmethod
+    def _resume_manual(state):
+        """Explicit user activation cannot override a protective stop."""
+        if (state.paused and state.paused_reason == "manual"
+                and not state.pending_applies and not state.hard_stopped
+                and not state.limit_exceeded and not state.cookies_expired):
+            state.paused = False
+            state.paused_reason = ""
+            state.consecutive_errors = 0
+            state.status = "idle"
+            state.status_detail = "Ожидание следующего цикла"
+            return True
+        return False
+
+    def hold_pending_apply(self, state, vacancy_id, resume_id, flow="apply", reason_code="unconfirmed"):
+        """Record an ambiguous result locally, never retry or contact HH."""
+        reason_code = reason_code if reason_code in (
+            "unconfirmed", "transport_unknown", "questionnaire_unconfirmed") else "unconfirmed"
+        item = {"vacancy_id": str(vacancy_id), "resume_id": str(resume_id or ""),
+                "flow": "questionnaire" if flow == "questionnaire" else "apply",
+                "recorded_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+                "reason_code": reason_code,
+                "reconcile_attempts": 0,
+                "reconcile_next_at": (datetime.now(timezone.utc) + timedelta(seconds=30)).isoformat(),
+                "reconcile_last_started_at": None}
+        with state._state_lock:
+            if not any(p.get("vacancy_id") == item["vacancy_id"] and
+                       p.get("resume_id") == item["resume_id"] for p in state.pending_applies):
+                state.pending_applies.append(item)
+            state.pending_apply = state.pending_applies[0]
+            state.paused = True
+            state.paused_reason = "outcome_unknown"
+            state.status = "idle"
+            state.status_detail = self._pause_detail(state)
+        self._persist_pauses()
+
+    def _quarantine_exhausted_apply(self, state):
+        """Release only an exhausted unknown pause, after durable exclusion."""
+        from app.apply_quarantine import retain
+        with state._state_lock:
+            pending = state.pending_apply
+            if (self.paused or self._stop_event.is_set() or state._deleted
+                    or not state.paused or state.paused_reason != 'outcome_unknown'
+                    or not pending or state.receipt_check_started_at
+                    or state.hard_stopped or state.limit_exceeded or state.cookies_expired
+                    or (CONFIG.auto_pause_errors > 0 and state.consecutive_errors >= CONFIG.auto_pause_errors)
+                    or getattr(state, '_reconcile_persistence_failed', False)
+                    or pending.get('reconcile_attempts') != 3
+                    or pending.get('reconcile_last_error') != 'unconfirmed'):
+                return False
+            previous = list(state.pending_applies)
+            try:
+                retain(state.acc, pending)
+            except Exception:
+                state._reconcile_persistence_failed = True
+                return False
+            state._auth_recovery_pending = True
+            state.pending_applies = [p for p in previous if p != pending]
+            state.pending_apply = state.pending_applies[0] if state.pending_applies else None
+            if not state.pending_apply:
+                state.paused = False
+                state.paused_reason = ''
+                state.status = 'idle'
+                state.status_detail = 'Неизвестный отклик изолирован; поиск других вакансий продолжится'
+        try:
+            self._persist_pauses(wait=True)
+        except Exception:
+            with state._state_lock:
+                state.pending_applies = previous
+                state.pending_apply = pending
+                state.paused = True
+                state.paused_reason = 'outcome_unknown'
+                state._reconcile_persistence_failed = True
+            return False
+        finally:
+            state._auth_recovery_pending = False
+        self._add_log(state.short, state.color,
+            'Неподтверждённый отклик изолирован без повторной отправки. Другие вакансии разрешены.', 'warning')
+        return True
+
+    def _reconcile_pending_if_due(self, state, *, now=None):
+        """At most three scheduled receipt checks, never a repeated application.
+
+        Runs in the existing worker thread. The shared receipt marker also
+        excludes a manual HTTP-route check until this GET and local CAS finish.
+        Each helper check may make one list GET and one exact-topic GET.
+        """
+        current_time = now or datetime.now(timezone.utc)
+        with state._state_lock:
+            if (self.paused or self._stop_event.is_set() or state._deleted
+                    or not state.paused or state.paused_reason != "outcome_unknown"
+                    or not state.pending_apply or state.receipt_check_started_at
+                    or getattr(state, "_reconcile_persistence_failed", False)):
+                return False
+            # Worker indices for temporary accounts are 900+n, whereas public
+            # reconciliation uses len(regular)+n. Resolve by object identity.
+            idx = next((i for i, item in enumerate(self.account_states) if item is state), None)
+            if idx is None:
+                idx = next((len(self.account_states) + i for i, item in self.temp_states.items()
+                            if item is state), None)
+            if idx is None:
+                return False
+            pending = state.pending_apply
+            if pending.get("reconcile_last_error") in ("auth", "rate_limit"):
+                return False  # Also applies to legacy records lacking a schedule.
+            schedule_keys = ("reconcile_attempts", "reconcile_next_at", "reconcile_last_started_at")
+            initialize = not any(key in pending for key in schedule_keys)
+            if initialize:
+                pending.update(reconcile_attempts=0,
+                    reconcile_next_at=(current_time + timedelta(seconds=30)).isoformat(),
+                    reconcile_last_started_at=None)
+            attempts = pending.get("reconcile_attempts")
+            if type(attempts) is not int or not 0 <= attempts <= 3:
+                # A malformed persisted budget is not permission to start over.
+                state._reconcile_persistence_failed = True
+                return False
+            if attempts >= 3:
+                return False
+            try:
+                due = datetime.fromisoformat(str(pending.get("reconcile_next_at") or "").replace("Z", "+00:00"))
+                if due.tzinfo is None:
+                    return False
+            except (ValueError, TypeError):
+                return False
+            if not initialize and due > current_time:
+                return False
+            if not pending.get("vacancy_id") or not pending.get("resume_id"):
+                return False
+            if initialize:
+                marker = None
+            else:
+                attempts += 1
+                marker = current_time.isoformat()
+                pending["reconcile_attempts"] = attempts
+                pending["reconcile_last_started_at"] = marker
+                # Reserve the following deadline before I/O as crash recovery.
+                delay = {1: 90, 2: 300}.get(attempts)
+                pending["reconcile_next_at"] = (current_time + timedelta(seconds=delay)).isoformat() if delay else None
+                state.receipt_check_started_at = marker
+            expected_pending = dict(pending)
+            expected_account = {"resume_hash": state.acc.get("resume_hash"),
+                                "user_id": state.acc.get("user_id"),
+                                "cookies": dict(state.acc.get("cookies") or {})}
+            acc = {**state.acc, "cookies": expected_account["cookies"].copy()}
+            acc["_pinned_resume_id"] = str(pending["resume_id"])
+            # Persisting this same state must not itself look like a newer
+            # user control transition during the compare-and-swap below.
+            note_pause(state)
+            control_before = self._limit_check_guard(state)
+        try:
+            self._persist_pauses(wait=True)
+        except Exception:
+            with state._state_lock:
+                state._reconcile_persistence_failed = True
+                if marker and state.receipt_check_started_at == marker:
+                    state.receipt_check_started_at = None
+            self._add_log(state.short, state.color,
+                "Автосверка не запущена: не удалось сохранить безопасное состояние. Отклик не повторялся.", "error")
+            return False
+        if initialize:
+            return False
+        try:
+            with state._state_lock:
+                if (self._get_apply_state(idx) is not state
+                        or self._limit_check_guard(state) != control_before
+                        or state.pending_apply != expected_pending
+                        or any(state.acc.get(key) != expected_account.get(key)
+                               for key in ("resume_hash", "user_id", "cookies"))):
+                    return False
+            from app import apply_confirmation as confirmation
+            receipt_failure = "unconfirmed"
+            try:
+                receipt = confirmation.confirm_application_receipt(acc,
+                    str(expected_pending["vacancy_id"]), str(expected_pending["resume_id"]))
+                if receipt is None:
+                    # Thread-local diagnostics must be consumed immediately in
+                    # this same worker, not later by the UI/event-loop thread.
+                    getter = getattr(confirmation, "receipt_check_failure_reason", None)
+                    if callable(getter):
+                        code = getter()
+                        if isinstance(code, str) and code in (
+                                "connect_timeout", "read_timeout", "auth", "rate_limit", "unconfirmed"):
+                            receipt_failure = code
+            except Exception:
+                receipt = None  # No raw proxy, auth or response details in logs.
+            with state._state_lock:
+                controls_unchanged = self._limit_check_guard(state) == control_before
+            if controls_unchanged and receipt and receipt.get("receipt_confirmed") is True:
+                if self.confirm_pending_apply(idx,
+                        str(expected_pending["vacancy_id"]), str(expected_pending["resume_id"]),
+                        str(receipt.get("negotiation_id") or ""),
+                        receipt_created_at=str(receipt.get("receipt_created_at") or ""),
+                        expected_state=state, expected_pending=expected_pending,
+                        expected_account=expected_account, expected_control=control_before):
+                    self._add_log(state.short, state.color,
+                        "Автосверка: отклик подтверждён в HH. Повторной отправки не было.", "success")
+                    return True
+            with state._state_lock:
+                if (self._get_apply_state(idx) is not state or state.pending_apply != expected_pending
+                        or any(state.acc.get(key) != expected_account.get(key)
+                               for key in ("resume_hash", "user_id", "cookies"))):
+                    return False
+                delay = {1: 90, 2: 300}.get(attempts)
+                finished_at = now or datetime.now(timezone.utc)
+                state.pending_apply["reconcile_last_error"] = receipt_failure
+                if receipt_failure in ("auth", "rate_limit"):
+                    delay = None  # No automatic probes after an explicit access/rate restriction.
+                state.pending_apply["reconcile_next_at"] = (finished_at + timedelta(seconds=delay)).isoformat() if delay else None
+            try:
+                self._persist_pauses(wait=True)
+            except Exception:
+                state._reconcile_persistence_failed = True
+            self._add_log(state.short, state.color,
+                f"Автосверка {attempts}/3: результат не удалось безопасно подтвердить; пауза сохранена. Отклик не повторялся.", "warning")
+            return False
+        finally:
+            with state._state_lock:
+                if state.receipt_check_started_at == marker:
+                    state.receipt_check_started_at = None
+
+    def record_receipt_failure(self, idx, reason, *, expected_state, expected_pending, expected_account):
+        """Persist a bounded GET diagnostic without resuming or resetting budget."""
+        code = reason if isinstance(reason, str) and reason in (
+            "connect_timeout", "read_timeout", "auth", "rate_limit", "unconfirmed") else "unconfirmed"
+        state = self._get_apply_state(idx)
+        if state is None or state is not expected_state:
+            return False
+        with state._state_lock:
+            if (state._deleted or self._get_apply_state(idx) is not state
+                    or not state.pending_apply or state.pending_apply != expected_pending
+                    or any(state.acc.get(key) != expected_account.get(key)
+                           for key in ("resume_hash", "user_id", "cookies"))):
+                return False
+            state.pending_apply["reconcile_last_error"] = code
+            if code in ("auth", "rate_limit"):
+                state.pending_apply["reconcile_next_at"] = None
+        try:
+            self._persist_pauses(wait=True)
+            return True
+        except Exception:
+            with state._state_lock:
+                state._reconcile_persistence_failed = True
+            return False
+
+    def confirm_pending_apply(self, idx, vacancy_id, resume_id, topic_id, *,
+                              receipt_created_at="", expected_state=None, expected_pending=None,
+                              expected_account=None, expected_control=None):
+        """Consume an externally verified receipt; this method performs no RPC.
+
+        The caller must verify exact account/vacancy/resume ownership using a
+        fresh HH receipt, and pass the state/pending snapshots from before I/O.
+        """
+        state = self._get_apply_state(idx)
+        if state is None or (expected_state is not None and state is not expected_state):
+            return False
+        with state._state_lock:
+            if state._deleted or self._get_apply_state(idx) is not state or not topic_id:
+                return False
+            if expected_control is not None and self._limit_check_guard(state) != expected_control:
+                return False
+            if expected_account is not None and any(
+                    state.acc.get(key) != expected_account.get(key)
+                    for key in ("resume_hash", "user_id", "cookies")):
+                return False
+            pending = state.pending_apply
+            if (not isinstance(pending, dict) or pending.get("vacancy_id") != str(vacancy_id)
+                    or pending.get("resume_id") != str(resume_id)
+                    or (expected_pending is not None and pending != expected_pending)):
+                return False
+            # A receipt proves existence, not that an old application happened
+            # today. Missing/malformed/future dates never inflate daily counts.
+            today_receipt = False
+            try:
+                from zoneinfo import ZoneInfo
+                receipt_at = datetime.fromisoformat(str(receipt_created_at).replace("Z", "+00:00"))
+                today_receipt = (receipt_at.tzinfo is not None
+                    and receipt_at <= datetime.now().astimezone()
+                    and receipt_at.astimezone(ZoneInfo("Europe/Moscow")).strftime("%Y-%m-%d") == _today_msk())
+            except (ValueError, TypeError, OverflowError):
+                pass
+            newly_counted = today_receipt and not is_applied(state.name, str(vacancy_id))
+            add_applied(state.name, str(vacancy_id), confirmed=newly_counted)
+            if newly_counted:
+                if state.daily_date != _today_msk():
+                    state.daily_date = _today_msk()
+                    state.daily_sent = 0
+                state.sent += 1
+                state.daily_sent += 1
+                if pending.get("flow") == "questionnaire":
+                    state.questionnaire_sent += 1
+                state.last_apply_at = str(receipt_created_at)
+            state.pending_applies.pop(0)
+            resolve_cycle_unknown(state, vacancy_id, receipt_created_at, locked=True)
+            state.pending_apply = state.pending_applies[0] if state.pending_applies else None
+            if not state.pending_apply and state.paused_reason == "outcome_unknown":
+                if state.hard_stopped or state.limit_exceeded:
+                    state.paused_reason = "limit"
+                elif state.cookies_expired:
+                    state.paused_reason = "auth"
+                elif CONFIG.auto_pause_errors > 0 and state.consecutive_errors >= CONFIG.auto_pause_errors:
+                    state.paused_reason = "auto_errors"
+                else:
+                    state.paused = False
+                    state.paused_reason = ""
+            state.status = "idle"
+            state.status_detail = self._pause_detail(state) if state.paused else "Отклик подтверждён в HH"
+        self._persist_pauses()
+        return True
+
+    def recover_verified_auth(self, idx, *, expected_state, expected_account, expected_control,
+                              recovery_reason="auth", expected_network_recovery=None):
+        """Local CAS only, after the route verifies account AND web bridge.
+
+        No RPC, refresh, quota reset, or recovery of other protective pauses.
+        Mutation dispatch stays blocked until the durable save has completed.
+        """
+        state = self._get_apply_state(idx)
+        if state is None or state is not expected_state or not isinstance(expected_account, dict):
+            return False
+        account_keys = ("resume_hash", "user_id", "cookies")
+        if (recovery_reason not in ("auth", "network_error")
+                or any(key not in expected_account for key in account_keys) or expected_control is None):
+            return False
+        with state._state_lock:
+            if (self._get_apply_state(idx) is not state or state._deleted
+                    or self.paused or self._stop_event.is_set() or state.pending_apply
+                    or state.pending_applies or state.hard_stopped or state.limit_exceeded
+                    or not state.paused or state.paused_reason != recovery_reason
+                    or (recovery_reason == "network_error" and (
+                        not isinstance(expected_network_recovery, dict)
+                        or state.network_recovery != expected_network_recovery
+                        or not self._valid_network_record(state, expected_network_recovery)))
+                    or getattr(state, "_auth_recovery_pending", False)
+                    or self._limit_check_guard(state) != expected_control
+                    or any(state.acc.get(key) != expected_account[key] for key in account_keys)):
+                return False
+            state._auth_recovery_pending = True
+            old_cookies_expired = state.cookies_expired
+            old_network_recovery = getattr(state, "network_recovery", None)
+            if recovery_reason == "network_error":
+                state.network_recovery = None
+            state.cookies_expired = False
+            state.paused = False
+            state.paused_reason = ""
+            note_pause(state)
+            recovered_control = self._limit_check_guard(state)
+        saved = False
+        try:
+            self._persist_pauses(wait=True)
+            saved = True
+        except Exception:
+            pass  # No raw storage/account data in the public result.
+        with state._state_lock:
+            if not saved and recovery_reason == "network_error":
+                state._network_recovery_persistence_failed = True
+            same_account = (all(state.acc.get(key) == expected_account[key] for key in account_keys)
+                and (recovery_reason != "network_error" or self._valid_network_record(state, old_network_recovery)))
+            success = (saved and self._get_apply_state(idx) is state
+                and self._limit_check_guard(state) == recovered_control and same_account)
+            if success:
+                state.consecutive_errors = 0
+                state._network_error_streak = 0
+                state._network_error_last_count = 0
+                state._network_recovery_persistence_failed = False
+                state.status = "idle"
+                state.status_detail = "Вход в HH и доступ к веб-анкете подтверждены"
+            elif not state.paused and state.paused_reason == "":
+                # A late failed/stale commit must not reopen after global pause
+                # or account replacement. Preserve any newer protective reason.
+                state.paused = True
+                state.paused_reason = recovery_reason
+                if recovery_reason == "network_error":
+                    state.network_recovery = old_network_recovery
+                if same_account:
+                    state.cookies_expired = old_cookies_expired
+                state.status_detail = "Снятие паузы не подтверждено; нужна повторная проверка"
+                note_pause(state)
+            state._auth_recovery_pending = False
+        if not success:
+            try:
+                self._persist_pauses(wait=True)
+            except Exception:
+                pass  # RAM remains blocked even if the storage is unavailable.
+        return success
+
+    @staticmethod
+    def _network_account_key(acc):
+        identity = {key: acc.get(key) for key in ("resume_hash", "user_id", "cookies", "mode")}
+        try:
+            return hashlib.sha256(json.dumps(identity, sort_keys=True, ensure_ascii=True).encode()).hexdigest()
+        except (ValueError, TypeError):
+            return None
+
+    @staticmethod
+    def _network_reason(info):
+        allowed = ("proxy_error", "tls_error", "connect_timeout", "read_timeout", "timeout",
+                   "connection_error", "network_error")
+        if (isinstance(info, dict) and info.get("error_type") == "oauth_bridge_network"
+                and info.get("phase") == "oauth_bridge" and info.get("dispatched") is False
+                and isinstance(info.get("reason"), str) and info["reason"] in allowed):
+            return info["reason"]
+        return None
+
+    @staticmethod
+    def network_recovery_view(state):
+        with state._state_lock:
+            record = getattr(state, "network_recovery", None)
+            if not isinstance(record, dict):
+                return None
+            return {key: record.get(key) for key in ("reason", "attempts", "next_check_at",
+                    "last_started_at", "last_error")}
+
+    def _valid_network_record(self, state, record):
+        account_key = self._network_account_key(state.acc)
+        return (isinstance(record, dict) and self._network_reason(record) is not None
+            and str(state.acc.get("mode") or "").lower() == "oauth"
+            and account_key is not None and record.get("account_key") == account_key
+            and type(record.get("attempts")) is int and 0 <= record["attempts"] < 1_000_000_000)
+
+    def _network_recovery_matches(self, idx, state, expected_account, expected_control, expected_record):
+        # Caller holds the state lock. No network or nested lock acquisition.
+        return (self._get_apply_state(idx) is state and not state._deleted
+            and not self.paused and not self._stop_event.is_set()
+            and state.paused and state.paused_reason == "network_error"
+            and not state.pending_apply and not state.pending_applies
+            and not state.hard_stopped and not state.limit_exceeded
+            and isinstance(expected_record, dict) and state.network_recovery == expected_record
+            and self._valid_network_record(state, expected_record)
+            and self._limit_check_guard(state) == expected_control
+            and all(state.acc.get(key) == expected_account.get(key)
+                    for key in ("resume_hash", "user_id", "cookies")))
+
+    def record_network_probe_failure(self, idx, reason, *, expected_state, expected_account,
+                                     expected_control, expected_network_recovery):
+        """Store only a known probe category; never clear pause or retry a POST."""
+        code = reason if isinstance(reason, str) and reason in (
+            "network", "auth", "challenge", "rate_limit", "unavailable", "stale") else "unavailable"
+        state = self._get_apply_state(idx)
+        if state is None or state is not expected_state:
+            return False
+        with state._state_lock:
+            if not self._network_recovery_matches(idx, state, expected_account,
+                    expected_control, expected_network_recovery):
+                return False
+            state.network_recovery["last_error"] = code
+            if code != "network":
+                state.network_recovery["next_check_at"] = None
+        try:
+            self._persist_pauses(wait=True)
+        except Exception:
+            with state._state_lock:
+                state._network_recovery_persistence_failed = True
+            return False
+        return True
+
+    def _network_probe_if_due(self, state, *, now=None):
+        """GET-only recovery, 30/90/300/900s backoff; 900s thereafter.
+
+        Only a persisted, owner-bound, known pre-POST network failure qualifies.
+        Every attempt is durably reserved before I/O. Restart cannot reset it.
+        """
+        at = now or datetime.now(timezone.utc)
+        invalid = False
+        with state._state_lock:
+            record = getattr(state, "network_recovery", None)
+            if (state.paused and state.paused_reason == "network_error" and isinstance(record, dict)
+                    and not self._valid_network_record(state, record) and record.get("next_check_at")):
+                record["last_error"] = "stale"
+                record["next_check_at"] = None
+                invalid = True
+        if invalid:
+            try:
+                self._persist_pauses(wait=True)
+            except Exception:
+                with state._state_lock:
+                    state._network_recovery_persistence_failed = True
+            return False
+        with state._state_lock:
+            if (self.paused or self._stop_event.is_set() or state._deleted
+                    or not state.paused or state.paused_reason != "network_error"
+                    or state.pending_apply or state.pending_applies or state.hard_stopped
+                    or state.limit_exceeded or state.cookies_expired
+                    or state.auth_check_started_at or state.receipt_check_started_at
+                    or getattr(state, "_auth_recovery_pending", False)
+                    or getattr(state, "_network_recovery_persistence_failed", False)
+                    or str(state.acc.get("mode") or "").lower() != "oauth"):
+                return False
+            record = state.network_recovery
+            if (not isinstance(record, dict) or self._network_reason(record) is None
+                    or record.get("account_key") != self._network_account_key(state.acc)
+                    or record.get("last_error") not in (None, "network")
+                    or type(record.get("attempts")) is not int
+                    or not 0 <= record["attempts"] < 1_000_000_000):
+                return False
+            try:
+                due = datetime.fromisoformat(str(record.get("next_check_at") or "").replace("Z", "+00:00"))
+                if due.tzinfo is None or due > at:
+                    return False
+            except (ValueError, TypeError):
+                return False
+            idx = next((i for i, item in enumerate(self.account_states) if item is state), None)
+            if idx is None:
+                idx = next((len(self.account_states) + i for i, item in self.temp_states.items()
+                            if item is state), None)
+            if idx is None:
+                return False
+            record["attempts"] += 1
+            delay = {1: 90, 2: 300}.get(record["attempts"], 900)
+            marker = at.isoformat()
+            record["last_started_at"] = marker
+            record["next_check_at"] = (at + timedelta(seconds=delay)).isoformat()
+            state.auth_check_started_at = marker
+            expected_record = dict(record)
+            expected_account = {"resume_hash": state.acc.get("resume_hash"),
+                "user_id": state.acc.get("user_id"), "cookies": dict(state.acc.get("cookies") or {})}
+            acc = {**state.acc, "cookies": expected_account["cookies"].copy()}
+            note_pause(state)
+            control = self._limit_check_guard(state)
+        try:
+            try:
+                self._persist_pauses(wait=True)
+            except Exception:
+                with state._state_lock:
+                    state._network_recovery_persistence_failed = True
+                return False
+            with state._state_lock:
+                if not self._network_recovery_matches(idx, state, expected_account, control, expected_record):
+                    return False
+            from app.auth_verification import verify_oauth_and_web_access
+            try:
+                proof = verify_oauth_and_web_access(acc)
+            except Exception:
+                proof = None  # Unexpected failure is not permission to keep probing.
+            if isinstance(proof, dict) and proof.get("verified") is True:
+                return self.recover_verified_auth(idx, expected_state=state,
+                    expected_account=expected_account, expected_control=control,
+                    recovery_reason="network_error", expected_network_recovery=expected_record)
+            reason = proof.get("reason") if isinstance(proof, dict) else "unavailable"
+            return self.record_network_probe_failure(idx, reason, expected_state=state,
+                expected_account=expected_account, expected_control=control,
+                expected_network_recovery=expected_record)
+        finally:
+            with state._state_lock:
+                if state.auth_check_started_at == marker:
+                    state.auth_check_started_at = None
+
+    def _hold_questionnaire_access(self, state, result):
+        """An explicit access/rate denial is not an expired token or quota."""
+        if result not in ("rate_limit", "challenge"):
+            return
+        with state._state_lock:
+            state.errors += 1
+            state.consecutive_errors += 1
+            # Never replace an unrelated manual/unknown/protective pause.
+            if not state.paused and not state.pending_apply:
+                state.paused = True
+                state.paused_reason = "hh_rate_limit" if result == "rate_limit" else "challenge"
+            state.status_detail = self._pause_detail(state)
+        self._persist_pauses()
+        self._add_log(state.short, state.color, state.status_detail, "warning")
 
     def reload_temp_sessions(self, sessions: list | None = None) -> int:
         """Refresh browser accounts after OTP materializes their sessions.
@@ -360,7 +1035,7 @@ class BotManager:
             urls.insert(0, default_resume_url)
         return urls
 
-    def activate_session(self, temp_idx: int) -> bool:
+    def activate_session(self, temp_idx: int, *, resume_manual: bool = True) -> bool:
         """Запустить браузерную сессию как полноценный бот-аккаунт."""
         with self._activate_lock:
             if temp_idx < 0 or temp_idx >= len(self.temp_sessions):
@@ -375,6 +1050,11 @@ class BotManager:
             if not ts.get("resume_hash"):
                 return False
             if temp_idx in self.temp_states:
+                if resume_manual:
+                    state = self.temp_states[temp_idx]
+                    with state._state_lock:
+                        self._resume_manual(state)
+                    self._persist_pauses()
                 return True  # уже запущен
             # Отфильтровываем сохранённые URL от других резюме — юзер мог
             # сменить resume_hash сессии, а ts["urls"] содержит `resume=<старый_hash>`.
@@ -410,10 +1090,24 @@ class BotManager:
                 "apply_tests": bool(ts.get("apply_tests", False)),
                 "safety_enabled": bool(ts.get("safety_enabled", CONFIG.skip_inconsistent)),
                 "mode": ts.get("mode", "web"),
+                "user_id": ts.get("user_id"),
+                "paused": ts.get("paused", False),
+                "paused_reason": ts.get("paused_reason", ""),
+                "hard_stopped": ts.get("hard_stopped", False),
+                "limit_exceeded": ts.get("limit_exceeded", False),
+                "pending_apply": ts.get("pending_apply"),
+                "pending_applies": ts.get("pending_applies"),
+                "network_recovery": ts.get("network_recovery"),
+                "all_resumes": ts.get("all_resumes", []),
             }
             state = AccountState(acc)
+            if resume_manual:
+                self._resume_manual(state)
+            self._bind_mutation_guard(state)
             self.temp_states[temp_idx] = state
             ts["bot_active"] = True
+            ts["paused"] = state.paused
+            ts["paused_reason"] = state.paused_reason
         save_browser_sessions(self.temp_sessions)
         log_debug(f"activate_session({temp_idx}): starting threads...")
         t1 = threading.Thread(target=self._run_account_worker, args=(900 + temp_idx, state), daemon=True, name=f"worker-{temp_idx}")
@@ -459,9 +1153,14 @@ class BotManager:
                 # и в pause-loop приведут к graceful exit потоков.
                 state._deleted = True
                 state.paused = True
-                state.paused_reason = 'manual'
+                if not getattr(state, "paused_reason", ""):
+                    state.paused_reason = 'manual'
+                ts.update({k: getattr(state, k) for k in (
+                    "paused_reason", "hard_stopped", "limit_exceeded", "pending_apply", "pending_applies", "network_recovery") if hasattr(state, k)})
             ts["bot_active"] = False
             ts["paused"] = True
+            if not ts.get("paused_reason"):
+                ts["paused_reason"] = "manual"
         # Аудит 2026-08-17 #19: раньше deactivate возвращался мгновенно, а
         # rapid activate → deactivate → activate успевало создать вторую
         # (перекрывающуюся) пару worker'ов для того же HH-аккаунта. Join'им
@@ -484,18 +1183,28 @@ class BotManager:
 
     def _get_apply_acc(self, idx: int) -> dict | None:
         """Вернуть acc dict для apply-эндпоинтов (обычный или временный аккаунт)"""
+        state = self._get_apply_state(idx)
+        if state is not None:
+            self._bind_mutation_guard(state)
+            return dict(state.acc)
         if 0 <= idx < len(self.account_states):
             return dict(self.account_states[idx].acc)
         temp_idx = idx - len(self.account_states)
         if 0 <= temp_idx < len(self.temp_sessions):
-            return dict(self.temp_sessions[temp_idx])
+            acc = dict(self.temp_sessions[temp_idx])
+            session = self.temp_sessions[temp_idx]
+            acc["_mutation_guard"] = lambda: (
+                any(item is session for item in self.temp_sessions)
+                and not session.get("paused", False)
+                and not self.paused and not self._stop_event.is_set())
+            return acc
         return None
 
     def _get_apply_state(self, idx: int):
         """Вернуть AccountState или None для temp-сессий"""
         if 0 <= idx < len(self.account_states):
             return self.account_states[idx]
-        return None
+        return getattr(self, "temp_states", {}).get(idx - len(self.account_states))
 
     def _start_ws_push(self, state) -> None:
         """Подписать аккаунт на chatik WS push.
@@ -593,6 +1302,7 @@ class BotManager:
         self._workers: list = []
         _load_cache()
         load_config()
+        self.paused = CONFIG.automation_paused
         # После load_config: если env HH_PROXY не задан, но в CONFIG.hh_proxy_url
         # что-то сохранено (пользователь выставлял через UI) — применить.
         # env всегда приоритет чтобы docker-compose override работал.
@@ -629,6 +1339,7 @@ class BotManager:
             log_debug(f"Failed to load recent responses: {e}")
         self.account_states = [AccountState(acc) for acc in accounts_data]
         for i, state in enumerate(self.account_states):
+            self._bind_mutation_guard(state)
             t1 = threading.Thread(
                 target=self._run_account_worker, args=(i, state), daemon=True
             )
@@ -674,9 +1385,8 @@ class BotManager:
         for i, ts in enumerate(self.temp_sessions):
             log_debug(f"start(): session {i}: bot_active={ts.get('bot_active')}, resume_hash={bool(ts.get('resume_hash'))}")
             if ts.get("bot_active") and ts.get("resume_hash"):
-                ts["paused"] = False  # Reset pause on startup
                 try:
-                    result = self.activate_session(i)
+                    result = self.activate_session(i, resume_manual=False)
                     log_debug(f"start(): activate_session({i}) = {result}")
                 except Exception as e:
                     log_debug(f"start(): activate_session({i}) ERROR: {e}")
@@ -684,6 +1394,7 @@ class BotManager:
 
     def stop(self):
         self._stop_event.set()
+        self._persist_pauses()
         # Останавливаем WS-клиенты у всех аккаунтов (regular + temp)
         for st in list(self.account_states) + list(self.temp_states.values()):
             ws = getattr(st, "_ws_client", None)
@@ -715,6 +1426,10 @@ class BotManager:
 
     def toggle_pause(self):
         self.paused = not self.paused
+        self._activity_global_pause_revision = getattr(self, "_activity_global_pause_revision", 0) + 1
+        self._activity_global_pause_started_at = aware_iso(datetime.now(timezone.utc)) if self.paused else None
+        CONFIG.automation_paused = self.paused
+        save_config()
         msg = "⏸️ Пауза" if self.paused else "▶️ Продолжение"
         level = "warning" if self.paused else "success"
         self._add_log("", "", msg, level)
@@ -738,17 +1453,22 @@ class BotManager:
         if not state:
             return
         with state._state_lock:
-            state.paused = not state.paused
-            if not state.paused:
-                # Reset hard stop / limit so worker can continue
-                state.hard_stopped = False
-                state.limit_exceeded = False
-                state.limit_reset_time = None
-                # Иначе следующая ошибка снова auto-pause'нет account (state_machine #6).
-                state.consecutive_errors = 0
-                state.paused_reason = ""
+            if state.paused:
+                resumed = self._resume_manual(state)
+                if (not resumed and state.paused_reason == "auto_errors"
+                        and not state.pending_applies and not state.hard_stopped
+                        and not state.limit_exceeded and not state.cookies_expired):
+                    state.paused = False
+                    state.paused_reason = ""
+                    state.consecutive_errors = 0
+                    state.status = "idle"
+                    state.status_detail = "Ожидание следующего цикла"
             else:
-                state.paused_reason = "manual"
+                state.paused = True
+                state.paused_reason = "outcome_unknown" if state.pending_apply else "manual"
+            if state.paused:
+                state.status_detail = self._pause_detail(state)
+        self._persist_pauses()
         msg = (
             f"⏸️ Аккаунт {state.short} приостановлен"
             if state.paused
@@ -876,9 +1596,18 @@ class BotManager:
         with lock:
             return list(dq)
 
-    def _check_auto_pause(self, state: AccountState):
+    def _check_auto_pause(self, state: AccountState, *, network_reason=None):
         """Авто-пауза при превышении лимита ошибок подряд."""
         n = CONFIG.auto_pause_errors
+        changed = False
+        with state._state_lock:
+            if network_reason is not None:
+                if getattr(state, "_network_error_last_count", 0) != state.consecutive_errors - 1:
+                    state._network_error_streak = 0
+                state._network_error_streak = getattr(state, "_network_error_streak", 0) + 1
+            else:
+                state._network_error_streak = 0
+            state._network_error_last_count = state.consecutive_errors
         if n > 0 and state.consecutive_errors >= n:
             with state._state_lock:
                 # Не перетираем manual pause: если пользователь только что снял паузу,
@@ -887,11 +1616,27 @@ class BotManager:
                 if state.consecutive_errors >= n and not state.paused:
                     state.paused = True
                     state.paused_reason = "auto_errors"
+                    if (network_reason is not None
+                            and state._network_error_streak == state.consecutive_errors
+                            and str(state.acc.get("mode") or "").lower() == "oauth"
+                            and not state.pending_apply and not state.pending_applies
+                            and not state.cookies_expired and not state.hard_stopped and not state.limit_exceeded):
+                        state.paused_reason = "network_error"
+                        state.network_recovery = {"reason": network_reason, "attempts": 0,
+                            "next_check_at": (datetime.now(timezone.utc) + timedelta(seconds=30)).isoformat(),
+                            "last_started_at": None, "last_error": None,
+                            "error_type": "oauth_bridge_network", "phase": "oauth_bridge", "dispatched": False,
+                            "account_key": self._network_account_key(state.acc)}
+                    state.status_detail = self._pause_detail(state)
+                    changed = True
                     self._add_log(
                         state.short, state.color,
-                        f"⛔ Авто-пауза: {n} ошибок подряд. Снимите вручную.",
+                        f"⛔ Сетевая пауза: {n} ошибок подготовки анкеты; соединение проверится без отправки отклика."
+                        if state.paused_reason == "network_error" else f"⛔ Авто-пауза: {n} ошибок подряд. Снимите вручную.",
                         "error",
                     )
+        if changed:
+            self._persist_pauses()
 
     def _maybe_roll_daily_counter(self, state: AccountState) -> bool:
         today = _today_msk()
@@ -904,8 +1649,9 @@ class BotManager:
                 # block с уже обнулённым счётчиком (kimi-search-1 #9).
                 state.limit_exceeded = False
                 state.limit_reset_time = None
-                # Сбрасываем paused если он был auto/limit (kimi-search-1 #9 extra) — но НЕ manual.
-                if state.paused and state.paused_reason in ("limit", "auto_errors"):
+                # A new day resets limits, not unknown outcomes or connectivity
+                # failures. Those require reconciliation / explicit retry.
+                if state.paused and state.paused_reason == "limit" and not state.pending_apply:
                     state.paused = False
                     state.paused_reason = ""
                     # Также сбрасываем счётчик ошибок — иначе следующая ошибка
@@ -913,6 +1659,27 @@ class BotManager:
                     state.consecutive_errors = 0
                 return True
         return False
+
+    def _limit_check_guard(self, state):
+        """Capture only control state, never credentials or mutable HTTP data."""
+        return (state.paused, state.paused_reason, state.hard_stopped,
+                state.limit_exceeded, state._deleted, bool(state.pending_apply),
+                getattr(state, "_activity_control_revision", 0), self.paused,
+                getattr(self, "_activity_global_pause_revision", 0), self._stop_event.is_set())
+
+    def _clear_checked_limit(self, state, before):
+        """A completed read must not undo a newer user/protective stop."""
+        with state._state_lock:
+            if (self._limit_check_guard(state) != before or state._deleted
+                    or state.pending_apply or self.paused or self._stop_event.is_set()
+                    or (state.paused and state.paused_reason != "limit")):
+                return False
+            state.limit_exceeded = False
+            state.limit_reset_time = None
+            state.paused = False
+            state.hard_stopped = False
+            state.status_detail = ""
+            return True
 
     def _add_response(
         self,
@@ -929,6 +1696,7 @@ class BotManager:
             "already": "\U0001f504",
             "limit": "\U0001f6ab",
             "error": "❌",
+            "unknown": "❔",
         }
         # HR online/offline + chat status вытаскиваем из vacancy_meta —
         # фронт показывает их в карточке отклика без extra-fetch'ей.
@@ -947,6 +1715,12 @@ class BotManager:
             "chat_write": _vm.get("chat_write_possibility", ""),
             "accept_auto": _vm.get("accept_auto_response"),
             "employer_rating": _vm.get("employer_rating") or None,
+            "manager_activity": _vm.get("manager_activity") or {},
+            "skills_match_percent": _vm.get("skills_match_percent"),
+            "relations": _vm.get("relations") or [],
+            "first_observed_at": _vm.get("first_observed_at"),
+            "publication_updated": _vm.get("publication_updated", False),
+            "observation_unavailable": _vm.get("observation_unavailable", False),
         }
         # Держим _deque_lock т.к. snap builder читает `list(self.recent_responses)`
         # без lock'а в другом потоке — иначе CPython RuntimeError и дроп тика.
@@ -983,6 +1757,8 @@ class BotManager:
             with s._state_lock:
                 _status = s.status
                 _status_detail = s.status_detail
+                if s.paused and s.paused_reason not in ("limit", ""):
+                    _status_detail = self._pause_detail(s)
                 _hh_interviews = s.hh_interviews
                 _hh_interviews_recent = s.hh_interviews_recent
                 _hh_viewed = s.hh_viewed
@@ -1013,6 +1789,7 @@ class BotManager:
                 "found_vacancies": s.found_vacancies,
                 "current_vacancy_title": s.current_vacancy_title,
                 "current_vacancy_company": s.current_vacancy_company,
+                "current_vacancy_signals": _current_vacancy_signals(s),
                 "current_vacancy_idx": _current_vacancy_idx,
                 "total_vacancies": _total_vacancies,
                 "salary_skipped": s.salary_skipped,
@@ -1083,6 +1860,14 @@ class BotManager:
                 "last_apply_at": s.last_apply_at,
                 "last_apply_attempt_at": s.last_apply_attempt_at,
                 "paused_reason": s.paused_reason,
+                "network_recovery": self.network_recovery_view(s),
+                "cycle_report": cycle_snapshot(s, blocked=s.paused or self.paused or s._deleted
+                    or getattr(self, "_stop_event", threading.Event()).is_set()),
+                "activity": activity_view(s, global_paused=self.paused,
+                    stopped=getattr(self, "_stop_event", threading.Event()).is_set(),
+                    global_started_at=getattr(self, "_activity_global_pause_started_at", None)),
+                "pending_apply": dict(s.pending_apply) if s.pending_apply else None,
+                "pending_applies": [dict(item) for item in s.pending_applies],
             })
 
         # Temp browser sessions — append after regular accounts
@@ -1103,6 +1888,8 @@ class BotManager:
                 with s._state_lock:
                     _status = s.status
                     _status_detail = s.status_detail
+                    if s.paused and s.paused_reason not in ("limit", ""):
+                        _status_detail = self._pause_detail(s)
                     _hh_interviews = s.hh_interviews
                     _hh_interviews_recent = s.hh_interviews_recent
                     _hh_viewed = s.hh_viewed
@@ -1138,6 +1925,7 @@ class BotManager:
                     "found_vacancies": s.found_vacancies,
                     "current_vacancy_title": s.current_vacancy_title,
                     "current_vacancy_company": s.current_vacancy_company,
+                    "current_vacancy_signals": _current_vacancy_signals(s),
                     "current_vacancy_idx": _current_vacancy_idx,
                     "total_vacancies": _total_vacancies,
                     "salary_skipped": s.salary_skipped,
@@ -1202,6 +1990,14 @@ class BotManager:
                     "last_apply_at": s.last_apply_at,
                     "last_apply_attempt_at": s.last_apply_attempt_at,
                     "paused_reason": s.paused_reason,
+                    "network_recovery": self.network_recovery_view(s),
+                    "cycle_report": cycle_snapshot(s, blocked=s.paused or self.paused or s._deleted
+                        or getattr(self, "_stop_event", threading.Event()).is_set()),
+                    "activity": activity_view(s, global_paused=self.paused,
+                        stopped=getattr(self, "_stop_event", threading.Event()).is_set(),
+                        global_started_at=getattr(self, "_activity_global_pause_started_at", None)),
+                    "pending_apply": dict(s.pending_apply) if s.pending_apply else None,
+                    "pending_applies": [dict(item) for item in s.pending_applies],
                 })
             else:
                 # Неактивная сессия — заглушка
@@ -1212,6 +2008,10 @@ class BotManager:
                     "color": "yellow",
                     "temp": True,
                     "bot_active": False,
+                    "cycle_report": None,
+                    "activity": activity_view(SimpleNamespace(
+                        pending_apply=ts.get("pending_apply"),
+                        paused_reason=ts.get("paused_reason", "")), stopped=True),
                     "resume_hash": ts.get("resume_hash", ""),
                     "all_resumes": ts.get("all_resumes", []),
                     "letter": ts.get("letter", ""),
@@ -1220,7 +2020,13 @@ class BotManager:
                     "current_vacancy_title": "", "current_vacancy_company": "",
                     "current_vacancy_idx": 0, "total_vacancies": 0,
                     "salary_skipped": 0, "questionnaire_sent": 0,
-                    "limit_exceeded": False, "paused": False,
+                    "limit_exceeded": bool(ts.get("limit_exceeded")), "paused": bool(ts.get("paused")),
+                    "paused_reason": ts.get("paused_reason", ""),
+                    "network_recovery": {key: ts["network_recovery"].get(key) for key in (
+                        "reason", "attempts", "next_check_at", "last_started_at", "last_error")}
+                        if isinstance(ts.get("network_recovery"), dict) else None,
+                    "pending_apply": dict(ts["pending_apply"]) if ts.get("pending_apply") else None,
+                    "pending_applies": [dict(item) for item in ts.get("pending_applies") or []],
                     "next_resume_touch": "", "resume_touch_status": "",
                     "hh_interviews": 0, "hh_viewed": 0, "hh_discards": 0,
                     "hh_not_viewed": 0, "hh_unread_by_employer": 0,
@@ -1272,6 +2078,7 @@ class BotManager:
 
         return {
             "type": "state_update",
+            "snapshot_at": aware_iso(datetime.now(timezone.utc)),
             "uptime_seconds": uptime,
             "paused": self.paused,
             "accounts": accounts,
@@ -1294,11 +2101,13 @@ class BotManager:
                 "daily_apply_limit": CONFIG.daily_apply_limit,
                 "hh_daily_limit": CONFIG.hh_daily_limit,
                 "fresh_vacancies_mode": CONFIG.fresh_vacancies_mode,
+                "prefer_hh_signals": CONFIG.prefer_hh_signals,
                 "fresh_vacancy_hours": CONFIG.fresh_vacancy_hours,
                 "fresh_apply_reserve": CONFIG.fresh_apply_reserve,
                 "stop_on_hh_limit": CONFIG.stop_on_hh_limit,
                 "llm_check_interval": CONFIG.llm_check_interval,
                 "allowed_schedules": CONFIG.allowed_schedules,
+                "remote_it_only": CONFIG.remote_it_only,
                 "title_include_keywords": getattr(CONFIG, "title_include_keywords", []),
                 "title_exclude_keywords": getattr(CONFIG, "title_exclude_keywords", []),
                 "questionnaire_templates": CONFIG.questionnaire_templates,
@@ -1364,9 +2173,14 @@ class BotManager:
                 break  # normal exit
             except Exception as e:
                 log_exception(f"WORKER CRASHED [{state.short}]", e)
+                cycle_operation_error(state)
+                finish_cycle(state, "error")
                 state.status = "error"
                 state.status_detail = f"Перезапуск через 30с ({str(e)[:30]})"
                 self._add_log(state.short, state.color, f"⚠️ Worker упал: {str(e)[:50]}. Перезапуск через 30с", "error")
+                set_activity(state, "recover_error", "Рабочий цикл завершился ошибкой; ожидает перезапуска",
+                    "Попробует начать новый цикл, если нет паузы или остановки",
+                    wait_until=datetime.now(timezone.utc) + timedelta(seconds=30))
                 time.sleep(30)
                 state.status = "idle"
                 state.status_detail = "Перезапущен после ошибки"
@@ -1374,9 +2188,11 @@ class BotManager:
 
     def _run_account_worker_inner(self, idx: int, state: AccountState) -> None:
         acc = state.acc
-
-        if not state._active_search_forced:
+        self._bind_mutation_guard(state)
+        if not state._active_search_forced and self._can_mutate(state):
             try:
+                set_activity(state, "resume_check", "Устанавливает статус поиска работы в HH",
+                    "Проверит доступность резюме и перейдёт к поиску вакансий")
                 r = get_client(acc).set_job_search_status("active_search")
                 if r.get("ok"):
                     state._active_search_forced = True
@@ -1391,24 +2207,26 @@ class BotManager:
 
         while not self._stop_event.is_set() and not state._deleted:
             # Global + per-account pause
-            while (self.paused or state.paused) and not self._stop_event.is_set() and not state._deleted:
+            while (self.paused or state.paused or getattr(state, "_auth_recovery_pending", False)) and not self._stop_event.is_set() and not state._deleted:
+                self._reconcile_pending_if_due(state)
+                self._quarantine_exhausted_apply(state)
+                self._network_probe_if_due(state)
+                if not self.paused and not state.paused and not getattr(state, "_auth_recovery_pending", False):
+                    break
                 # Auto-reset daily limit pause when new day starts
                 if state.hard_stopped:
                     if self._maybe_roll_daily_counter(state):
-                        # Не снимаем manual pause — если юзер сам остановил аккаунт,
-                        # midnight-rollover не должен его перезапускать (swarm-12 #8).
-                        if state.paused_reason != "manual":
-                            state.paused = False
-                            state.paused_reason = ""
-                        state.limit_exceeded = False
-                        state.limit_reset_time = None
+                        # _maybe_roll_daily_counter clears limit pauses only;
+                        # an unresolved write must survive midnight unchanged.
                         state.status = "idle"
                         state.status_detail = "Новый день — лимит сброшен"
                         self._add_log(state.short, state.color,
                             "\U0001f305 Новый день! Лимит сброшен" + (
                                 "" if state.paused_reason != "manual" else ", аккаунт остался на manual pause"),
                             "success")
-                        break
+                        self._persist_pauses()
+                        if not state.paused and not self.paused:
+                            break
                 if state.hard_stopped:
                     state.status = "limit"
                     if CONFIG.daily_apply_limit > 0 and state.daily_sent >= CONFIG.daily_apply_limit:
@@ -1427,7 +2245,9 @@ class BotManager:
                         state.status_detail = "Лимит HH. Проверка через 1м"
                 else:
                     state.status = "idle"
-                    state.status_detail = "Пауза пользователем"
+                    state.status_detail = (self._pause_detail(state) if state.paused else
+                        "Сохраняет результат проверки авторизации" if getattr(state, "_auth_recovery_pending", False)
+                        else "Общая пауза")
                 time.sleep(1)
 
             if self._stop_event.is_set():
@@ -1444,6 +2264,8 @@ class BotManager:
                     should_touch = True
 
                 if should_touch:
+                    set_activity(state, "resume_check", "Проверяет в HH, доступно ли поднятие резюме",
+                        "Поднимет резюме только при разрешении HH, затем продолжит поиск")
                     # Всегда сверяемся с сервером непосредственно перед publish:
                     # UI/фоновая статистика используют 5-минутный cache и после
                     # предыдущего touch могут ещё показывать устаревшее `true`.
@@ -1462,6 +2284,8 @@ class BotManager:
                             state.resume_touch_status = "⏳ HH пока не разрешает поднятие"
                     elif fresh_status.get("can_publish_or_update"):
                         self._add_log(state.short, state.color, "\U0001f4e4 Поднимаю резюме...", "info")
+                        set_activity(state, "resume_touch", "Выполняет поднятие резюме и проверяет результат",
+                            "После ответа HH продолжит рабочий цикл")
                         success, message = get_client(acc).touch_resume()
                         # Результат publish немедленно делает прежний cache статуса
                         # недействительным. Следующее время берём только у HH.
@@ -1503,14 +2327,13 @@ class BotManager:
                 if now >= state.limit_reset_time:
                     state.status = "checking"
                     state.status_detail = "Проверка сброса лимита..."
+                    set_activity(state, "limit_check", "Проверяет в HH, снят ли лимит откликов",
+                        "Продолжит только при подтверждённой доступности и отсутствии паузы")
                     self._add_log(state.short, state.color, "\U0001f50d Проверяю сброс лимита...", "info")
 
-                    if not get_client(acc).check_limit():
-                        state.limit_exceeded = False
-                        state.limit_reset_time = None
-                        state.paused = False
-                        state.hard_stopped = False
-                        state.status_detail = ""
+                    with state._state_lock:
+                        limit_check_before = self._limit_check_guard(state)
+                    if get_client(acc).check_limit() is False and self._clear_checked_limit(state, limit_check_before):
                         self._add_log(
                             state.short, state.color, "✅ Лимит сброшен! Продолжаю работу", "success"
                         )
@@ -1523,16 +2346,25 @@ class BotManager:
                             f"⏳ Лимит ещё активен, попробую в {state.limit_reset_time.strftime('%H:%M')}",
                             "warning",
                         )
+                        set_activity(state, "limit_wait", "Лимит ещё не подтверждён как снятый; ожидает проверки",
+                            "Проверит доступность откликов после ожидания",
+                            wait_until=state.limit_reset_time)
                         time.sleep(60)
                         continue
                 else:
                     state.status = "limit"
                     remaining = int((state.limit_reset_time - now).total_seconds())
                     state.status_detail = f"Проверка через {remaining}с"
+                    set_activity(state, "limit_wait", "Ожидает запланированной проверки лимита HH",
+                        "Проверит доступность откликов, если нет паузы",
+                        wait_until=state.limit_reset_time)
                     time.sleep(30)
                     continue
 
             # === СБОР ВАКАНСИЙ (ПАРАЛЛЕЛЬНО) ===
+            begin_cycle(state)
+            set_activity(state, "search_setup", "Получает сохранённые поиски HH и готовит параметры поиска",
+                "Загрузит вакансии по выбранным поискам")
             # Если у аккаунта нет своих URL — используем глобальный пул
             effective_urls = list(acc.get("urls") or [_url_entry(u)["url"] for u in CONFIG.url_pool])
             # Auto-merge сохранённых поисков юзера с hh.ru (cached 1h) — добавляются
@@ -1548,10 +2380,13 @@ class BotManager:
                         effective_urls.append(web_url)
             except Exception as e:
                 log_debug(f"saved_searches merge error [{state.short}]: {e}")
+                cycle_operation_error(state)
             state.total_urls = len(effective_urls)
 
             state.status = "collecting"
             state.status_detail = "Начинаю параллельный сбор..."
+            set_activity(state, "collect", "Загружает вакансии из HH",
+                "Проверит результаты и исключит уже обработанные вакансии")
             state.vacancies_by_url = {}
             state.vacancy_meta = {}  # Сброс метаданных вакансий для нового цикла
 
@@ -1590,12 +2425,19 @@ class BotManager:
                         state.degraded_mode = False
             except Exception as e:
                 log_exception(f"COLLECT CRASH [{state.short}]", e)
+                cycle_operation_error(state)
+                finish_cycle(state, "error")
                 state.status = "error"
                 state.status_detail = f"Ошибка сбора: {str(e)[:50]}"
+                set_activity(state, "recover_error", "Не удалось завершить сбор вакансий; ожидает повторного цикла",
+                    "Повторит поиск, если нет защитной остановки",
+                    wait_until=datetime.now(timezone.utc) + timedelta(seconds=60))
                 time.sleep(60)
                 continue
 
             all_vacancies = []
+            set_activity(state, "filter", "Объединяет результаты и проверяет дополнительные подборки HH",
+                "Исключит неподходящие и уже обработанные вакансии")
             for url in effective_urls:
                 url_vacancies = results_by_url.get(url, set())
                 state.vacancies_by_url[url] = len(url_vacancies)
@@ -1608,6 +2450,7 @@ class BotManager:
             state.url_stats = dict(state.vacancies_by_url)
 
             unique_vacancies = set(all_vacancies)
+            cycle_raw_count = len(all_vacancies)
             # related_vacancies — рекомендательный фид HH под seed-вакансию.
             # Обычно match'ит лучше чем текстовый поиск (внутренний ML ranker).
             # Один запрос на цикл — берём последнюю applied как seed.
@@ -1624,6 +2467,10 @@ class BotManager:
                 if seed_vid:
                     try:
                         related = get_client(acc).fetch_related_vacancies(str(seed_vid), max_pages=1)
+                        if related is None:
+                            cycle_raw_count = None
+                        elif cycle_raw_count is not None:
+                            cycle_raw_count += len(related)
                         if related:
                             new_ids = set(related) - unique_vacancies
                             unique_vacancies |= set(related)
@@ -1632,12 +2479,18 @@ class BotManager:
                                     f"\U0001f517 Related: +{len(new_ids)} вакансий (seed {seed_vid})", "info")
                     except Exception as e:
                         log_debug(f"related_vacancies error [{state.short}]: {e}")
+                        cycle_raw_count = None
+                        cycle_operation_error(state)
             # Favorited из HH — приоритетные кандидаты юзера. Подмешиваем в общий
             # пул (фильтры применятся как обычно — has_test и т.д.). Хранятся
             # отдельно чтобы apply phase могла отсортировать их вперёд.
             favorited_ids: set = set()
             try:
                 fav = fetch_favorited_vacancies(acc)
+                if fav is None:
+                    cycle_raw_count = None
+                elif cycle_raw_count is not None:
+                    cycle_raw_count += len(fav)
                 if fav:
                     favorited_ids = set(fav)
                     new_count = len(favorited_ids - unique_vacancies)
@@ -1650,11 +2503,16 @@ class BotManager:
                         )
             except Exception as e:
                 log_debug(f"favorited merge error [{state.short}]: {e}")
+                cycle_raw_count = None
+                cycle_operation_error(state)
+            found_cycle(state, unique_vacancies, cycle_raw_count)
             # Blacklisted из HH — фильтруем сразу
             try:
                 bl = fetch_blacklisted_vacancies(acc)
                 if bl:
                     blocked_count = len(unique_vacancies & bl)
+                    for blocked_vid in unique_vacancies & bl:
+                        cycle_outcome(state, blocked_vid, "skipped", "hh_blacklist")
                     unique_vacancies -= bl
                     if blocked_count:
                         self._add_log(
@@ -1664,6 +2522,7 @@ class BotManager:
                         )
             except Exception as e:
                 log_debug(f"blacklist filter error [{state.short}]: {e}")
+                cycle_operation_error(state)
             state._favorited_ids = favorited_ids  # для приоритизации в apply
             total_collected = len(unique_vacancies)
 
@@ -1684,18 +2543,25 @@ class BotManager:
                         "⚠️ Куки протухли и OAuth-fallback пуст. Обновите куки.", "error",
                     )
                     self._add_acc_event(state, "⚠️", "error", "Авторизация", "", "Обновите куки")
+                    finish_cycle(state, "blocked")
                     continue
                 state.status = "waiting"
                 state.status_detail = "Нет вакансий"
+                set_activity(state, "no_new", "Поиск не вернул вакансий; ожидает следующего цикла",
+                    "Снова проверит выбранные поиски HH",
+                    wait_until=datetime.now(timezone.utc) + timedelta(seconds=120))
                 self._add_log(
                     state.short, state.color,
                     "⚠️ Не найдено ни одной вакансии, пауза 2 мин",
                     "warning",
                 )
+                finish_cycle(state)
                 time.sleep(120)
                 continue
 
             # Фильтрация
+            set_activity(state, "filter", "Проверяет условия вакансий и исключает уже обработанные",
+                "Соберёт очередь подходящих вакансий для проверки перед откликом")
             filtered = []
             already_count = 0
             test_count = 0
@@ -1718,12 +2584,20 @@ class BotManager:
             discard_skipped = 0
             unsafe_skipped = 0
             for vid in unique_vacancies:
+                consider_cycle(state, vid)
                 meta = state.vacancy_meta.get(vid, {})
                 title = (meta.get("title") or "").lower()
                 log_debug(f"Processing vacancy {vid}: {title}")
+                if CONFIG.remote_it_only:
+                    scope_reason = remote_it_rejection(meta)
+                    if scope_reason:
+                        cycle_outcome(state, vid, 'skipped', scope_reason)
+                        continue
                 if not title:
+                    cycle_outcome(state, vid, "skipped", "missing_title")
                     continue
                 if meta.get("archived"):
+                    cycle_outcome(state, vid, "skipped", "archived")
                     continue
                 # Android requests these flags on resume-based searches. A
                 # misleading vacancy needs a human decision; an immediate
@@ -1732,6 +2606,7 @@ class BotManager:
                     unsafe_skipped += 1
                     state.safety_misleading_skipped += 1
                     state.safety_last_reason = f"{vid}: предупреждение HH о вакансии"
+                    cycle_outcome(state, vid, "skipped", "hh_warning")
                     continue
                 if state.safety_enabled and meta.get("immediate_redirect_vacancy_id"):
                     unsafe_skipped += 1
@@ -1739,18 +2614,22 @@ class BotManager:
                     state.safety_last_reason = (
                         f"{vid}: redirect → {meta.get('immediate_redirect_vacancy_id')}"
                     )
+                    cycle_outcome(state, vid, "skipped", "redirect")
                     continue
                 if title_include_keywords and not any(k in title for k in title_include_keywords):
                     title_skipped += 1
+                    cycle_outcome(state, vid, "skipped", "title_include")
                     continue
                 if title_exclude_keywords and any(k in title for k in title_exclude_keywords):
                     title_skipped += 1
+                    cycle_outcome(state, vid, "skipped", "title_exclude")
                     continue
                 # HH сам метит вакансии меткой DISCARD когда нас уже отвергли —
                 # повторный отклик чаще всего бесполезен, экономим лимит/токены.
                 hh_labels = meta.get("hh_labels") or []
                 if "DISCARD" in hh_labels:
                     discard_skipped += 1
+                    cycle_outcome(state, vid, "skipped", "previous_rejection")
                     continue
                 # В strict OAuth/mobile режиме анкета открывается через штатный
                 # autologin WebView bridge. Только degraded web-сессия без этого
@@ -1759,6 +2638,7 @@ class BotManager:
                     meta.get("has_test") or meta.get("response_letter_required")
                 ):
                     state.degraded_skipped += 1
+                    cycle_outcome(state, vid, "skipped", "degraded_form")
                     continue
                 # Vacancy quality gates через GET /vacancies/{vid} — lazy: вызываем
                 # только если хотя бы один из флагов включён (иначе extra-fetch для
@@ -1776,12 +2656,15 @@ class BotManager:
                         meta["accredited_it_employer"] = det.get("accredited_it_employer")
                         meta["key_skills"] = det.get("key_skills") or []
                         if det.get("archived"):
+                            cycle_outcome(state, vid, "skipped", "archived")
                             continue
                         if CONFIG.skip_auto_response_vacancies and det.get("auto_response"):
                             state.rating_skipped = getattr(state, "rating_skipped", 0) + 1
+                            cycle_outcome(state, vid, "skipped", "auto_response")
                             continue
                         if CONFIG.accredited_it_only and not det.get("accredited_it_employer"):
                             state.rating_skipped = getattr(state, "rating_skipped", 0) + 1
+                            cycle_outcome(state, vid, "skipped", "accreditation")
                             continue
                 # Employer rating gate: пропускаем низкорейтинговых работодателей.
                 # Только если у нас есть employer_id (OAuth-сбор всегда даёт,
@@ -1794,29 +2677,38 @@ class BotManager:
                             if (CONFIG.min_employer_rating > 0
                                 and rating_info.get("rating", 0) < CONFIG.min_employer_rating):
                                 state.rating_skipped = getattr(state, "rating_skipped", 0) + 1
+                                cycle_outcome(state, vid, "skipped", "employer_rating")
                                 continue
                             if (CONFIG.min_recommendations_percent > 0
                                 and rating_info.get("recommendations_percent", 0) < CONFIG.min_recommendations_percent):
                                 state.rating_skipped = getattr(state, "rating_skipped", 0) + 1
+                                cycle_outcome(state, vid, "skipped", "recommendations")
                                 continue
                         # Cache hit для UI / Apply tab
                         if rating_info:
                             meta["employer_rating"] = rating_info
+                if quarantine_blocked(acc, vid):
+                    cycle_outcome(state, vid, 'skipped', 'outcome_unknown')
+                    continue
                 if is_applied(acc["name"], vid):
                     already_count += 1
                     state.already_applied += 1
+                    cycle_outcome(state, vid, "already")
                 elif (is_test(vid) or state._test_failures.get(vid, 0) >= 2) and not apply_tests:
                     test_count += 1
                     state.tests += 1
+                    cycle_outcome(state, vid, "skipped", "questionnaire_disabled")
                 elif CONFIG.allowed_schedules:
                     sched = schedule_map.get(vid, set())
                     if sched and not sched.intersection(CONFIG.allowed_schedules):
                         schedule_skipped += 1
+                        cycle_outcome(state, vid, "skipped", "schedule")
                     elif CONFIG.min_salary > 0:
                         sal = salary_map.get(vid)
                         if sal is None or sal < CONFIG.min_salary:
                             salary_skipped += 1
                             state.salary_skipped += 1
+                            cycle_outcome(state, vid, "skipped", "salary")
                         else:
                             filtered.append(vid)
                     else:
@@ -1826,6 +2718,7 @@ class BotManager:
                     if sal is None or sal < CONFIG.min_salary:
                         salary_skipped += 1
                         state.salary_skipped += 1
+                        cycle_outcome(state, vid, "skipped", "salary")
                     else:
                         filtered.append(vid)
                 else:
@@ -1837,6 +2730,7 @@ class BotManager:
             fav_set = getattr(state, "_favorited_ids", set()) or set()
             if filtered:
                 random.shuffle(filtered)
+                signal_now = datetime.now(timezone.utc)
                 def _bucket(v):
                     meta = state.vacancy_meta.get(v, {}) or {}
                     fresh = CONFIG.fresh_vacancies_mode and _is_fresh_vacancy(
@@ -1845,6 +2739,7 @@ class BotManager:
                     published_score = -(published.timestamp()) if published else 0
                     return (
                         0 if fresh else 1,
+                        *(vacancy_signal_priority(meta, now=signal_now) if CONFIG.prefer_hh_signals else ()),
                         0 if v in fav_set else 1,
                         0 if CONFIG.prefer_quick_responses and meta.get("quick_responses_allowed") else 1,
                         published_score if fresh else 0,
@@ -1864,8 +2759,12 @@ class BotManager:
             )
 
             if not filtered:
+                finish_cycle(state)
                 state.status = "waiting"
                 state.status_detail = "Нет новых вакансий"
+                set_activity(state, "no_new", "После фильтров не осталось новых вакансий для отклика",
+                    "Повторит поиск; уже обработанные вакансии повторно не отправляет",
+                    wait_until=datetime.now(timezone.utc) + timedelta(seconds=120))
                 self._add_log(
                     state.short, state.color,
                     f"⚠️ Все вакансии уже обработаны ({already_count} откликов, {test_count} тестов), пауза 2 мин",
@@ -1901,6 +2800,8 @@ class BotManager:
                         filtered.sort(key=lambda v: (
                             0 if (CONFIG.fresh_vacancies_mode and _is_fresh_vacancy(
                                 state.vacancy_meta.get(v, {}) or {}, CONFIG.fresh_vacancy_hours)) else 1,
+                            *(vacancy_signal_priority(state.vacancy_meta.get(v, {}) or {}, now=signal_now)
+                              if CONFIG.prefer_hh_signals else ()),
                             0 if v in offer_vids else 1,
                         ))
                         hot = [v for v in filtered if v in offer_vids]
@@ -1928,6 +2829,10 @@ class BotManager:
             # === ОТПРАВКА ОТКЛИКОВ (ПАКЕТАМИ) ===
             state.status = "applying"
             state.status_detail = f"0/{state.total_vacancies}"
+            self._activity_vacancy(state)
+            set_activity(state, "preflight", "Готовит очередь вакансий к проверке перед откликом",
+                "Проверит ограничения и пригодность очередной вакансии",
+                progress=(0, state.total_vacancies))
 
             batch_size = CONFIG.batch_responses
             i = 0
@@ -1998,6 +2903,7 @@ class BotManager:
                                 state.hh_today_applies = server_used
                                 state.hh_today_applies_updated = datetime.now().isoformat(timespec="seconds")
                             used = max(used, server_used)
+                    cycle_batch_before = set(batch)
                     protected_batch, deferred_old = _protect_fresh_batch(
                         batch, state.vacancy_meta,
                         hours=CONFIG.fresh_vacancy_hours,
@@ -2007,10 +2913,14 @@ class BotManager:
                     )
                     if deferred_old:
                         state.fresh_reserved_skipped += deferred_old
+                    for deferred_vid in cycle_batch_before - set(protected_batch):
+                        cycle_outcome(state, deferred_vid, "skipped", "fresh_reserve")
                     batch = protected_batch
                     if not batch:
                         state.status = "waiting"
                         state.status_detail = f"Резерв {reserve} откликов для свежих вакансий"
+                        set_activity(state, "fresh_reserve", "Оставшиеся отклики зарезервированы для свежих вакансий",
+                            "В следующем цикле снова проверит свежие вакансии")
                         self._add_log(
                             state.short, state.color,
                             f"🆕 Резерв: старые вакансии отложены; {reserve} слотов сохранено для публикаций ≤{CONFIG.fresh_vacancy_hours}ч",
@@ -2018,14 +2928,24 @@ class BotManager:
                         )
                         break
 
+                # A private account copy pins one resume for the entire attempt.
+                attempt_accounts = {vid: dict(acc) for vid in batch}
+                for scope_vid, attempt_acc in attempt_accounts.items():
+                    attempt_acc['_mutation_guard'] = lambda vid=scope_vid: self._can_mutate(state) and not quarantine_blocked(state.acc, vid) and (
+                        not CONFIG.remote_it_only or remote_it_rejection(state.vacancy_meta.get(vid, {})) is None)
                 # Pre-check: skip inconsistent vacancies if enabled
                 if state.safety_enabled:
+                    set_activity(state, "preflight", "Проверяет вакансии и выбранное резюме перед отправкой",
+                        "Отправит только прошедшие проверку отклики, если нет ограничений",
+                        progress=(min(i, len(filtered)), len(filtered)))
                     checked_batch = []
                     for vid in batch:
                         if self.paused or self._stop_event.is_set() or state.paused or getattr(state, "_deleted", False):
                             break
-                        precheck = get_client(acc).check_vacancy_before_apply(vid)
+                        self._activity_vacancy(state, vid)
+                        precheck = get_client(attempt_accounts[vid]).check_vacancy_before_apply(vid)
                         if not precheck["ok"]:
+                            cycle_outcome(state, vid, "skipped", "preflight")
                             reason = precheck.get('reason') or ', '.join(precheck.get('hard_missing', []))
                             state.safety_inconsistent_skipped += 1
                             state.safety_last_reason = f"{vid}: {reason}"
@@ -2034,6 +2954,9 @@ class BotManager:
                             self._add_log(state.short, state.color,
                                 f"⏭ {display_title}: пропуск ({reason})", "warning")
                         else:
+                            if precheck.get("resume_id"):
+                                attempt_accounts[vid]["resume_hash"] = str(precheck["resume_id"])
+                                attempt_accounts[vid]["_pinned_resume_id"] = str(precheck["resume_id"])
                             if precheck.get("soft_missing"):
                                 self._add_log(state.short, state.color,
                                     f"⚠️ {vid}: можно откликнуться; рекомендуется: {', '.join(precheck['soft_missing'])}", "warning")
@@ -2087,18 +3010,40 @@ class BotManager:
                         if self.paused or self._stop_event.is_set() or state.paused or getattr(state, "_deleted", False):
                             break
                         try:
-                            result = _oauth_apply(acc, vid, acc.get("letter", ""))
+                            self._activity_vacancy(state, vid)
+                            set_activity(state, "apply", "Отправляет отклик и ожидает ответа HH",
+                                "Учтёт ответ HH; при неизвестном результате остановится для сверки",
+                                progress=(min(i + batch.index(vid), len(filtered)), len(filtered)), operation=(i, vid))
+                            result = _oauth_apply(attempt_accounts[vid], vid, acc.get("letter", ""))
                             results.append(result)
+                            if isinstance(result, tuple) and result[0] == "unknown":
+                                self.hold_pending_apply(state, vid,
+                                    attempt_accounts[vid].get("_pinned_resume_id") or attempt_accounts[vid].get("resume_hash", ""),
+                                    reason_code="transport_unknown")
+                                break
                         except Exception as e:
                             results.append(e)
+                            if (getattr(e, "outcome_unknown", False)
+                                    or getattr(e, "status_code", None) == 0
+                                    or (getattr(e, "status_code", 0) or 0) >= 500):
+                                self.hold_pending_apply(state, vid,
+                                    attempt_accounts[vid].get("_pinned_resume_id") or attempt_accounts[vid].get("resume_hash", ""),
+                                    reason_code="transport_unknown")
+                                break
                         if CONFIG.response_delay > 0:
+                            set_activity(state, "wait_between_batches", "Выдерживает интервал между откликами",
+                                "Проверит возможность обработки следующей вакансии",
+                                wait_until=datetime.now(timezone.utc) + timedelta(seconds=CONFIG.response_delay))
                             time.sleep(CONFIG.response_delay)
                 else:
+                    self._activity_vacancy(state)
+                    set_activity(state, "apply", "Отправляет пакет откликов и ожидает ответы HH",
+                        "Учтёт подтверждённые результаты; неизвестные результаты потребуют сверки",
+                        progress=(min(i, len(filtered)), len(filtered)), operation=(i, tuple(batch)))
                     # Web: async batch via aiohttp
-                    client = get_client(acc)
                     def _make_send_batch(b):
                         async def send_batch():
-                            tasks = [client.submit_response(vid,
+                            tasks = [get_client(attempt_accounts[vid]).submit_response(vid,
                                         letter_max_length=state.vacancy_meta.get(vid, {}).get("letter_max_length"))
                                      for vid in b]
                             return await asyncio.gather(*tasks, return_exceptions=True)
@@ -2108,7 +3053,48 @@ class BotManager:
                 # Persist confirmed successes first, even if stop/limit arrives
                 # while requests are in flight. Error handling below may break.
                 completed = _completed_apply_results(batch, results)
+                # Persist every ambiguous write before an unrelated limit/auth
+                # result can stop processing this already-completed batch.
+                for pending_vid, pending_result in completed:
+                    ambiguous = (isinstance(pending_result, tuple) and pending_result[0] == "unknown")
+                    ambiguous = ambiguous or (isinstance(pending_result, Exception) and (
+                        getattr(pending_result, "outcome_unknown", False)
+                        or getattr(pending_result, "status_code", None) == 0
+                        or (getattr(pending_result, "status_code", 0) or 0) >= 500))
+                    # Account for all completed replies before the legacy loop
+                    # can break on an unrelated auth/limit result. No dispatch.
+                    if isinstance(pending_result, MutationBlocked):
+                        cycle_outcome(state, pending_vid, "skipped", "cancelled")
+                    elif ambiguous:
+                        cycle_outcome(state, pending_vid, "unknown")
+                    elif isinstance(pending_result, Exception):
+                        cycle_outcome(state, pending_vid, "error")
+                    elif isinstance(pending_result, tuple) and pending_result:
+                        cycle_result = pending_result[0]
+                        if cycle_result in ("sent", "already"):
+                            cycle_outcome(state, pending_vid, cycle_result)
+                        elif cycle_result in ("error", "auth_error", "rate_limit", "challenge"):
+                            cycle_outcome(state, pending_vid, "error")
+                        elif cycle_result in ("cancelled", "limit"):
+                            cycle_outcome(state, pending_vid, "skipped",
+                                "cancelled" if cycle_result == "cancelled" else "hh_limit")
+                        elif cycle_result == "test":
+                            if state.apply_tests or CONFIG.auto_apply_tests:
+                                questionnaire_cycle(state, pending_vid)
+                            else:
+                                cycle_outcome(state, pending_vid, "skipped", "questionnaire_disabled")
+                    if ambiguous:
+                        self.hold_pending_apply(state, pending_vid,
+                            attempt_accounts[pending_vid].get("_pinned_resume_id") or attempt_accounts[pending_vid].get("resume_hash", ""),
+                            reason_code="transport_unknown")
                 for j, (vid, result_data) in enumerate(completed):
+                    if isinstance(result_data, MutationBlocked):
+                        continue
+                    if isinstance(result_data, Exception) and (
+                            getattr(result_data, "outcome_unknown", False)
+                            or getattr(result_data, "status_code", None) == 0
+                            or (getattr(result_data, "status_code", 0) or 0) >= 500):
+                        result_data = ("unknown", {})
                     # A pause cancels future sends, never accounting for replies
                     # already received from HH.
                     # Любая итерация — это попытка отклика. Запоминаем время,
@@ -2125,6 +3111,17 @@ class BotManager:
                         continue
 
                     result, info = result_data
+
+                    if result == "cancelled":
+                        continue
+                    if result == "unknown":
+                        self.hold_pending_apply(state, vid,
+                            attempt_accounts[vid].get("_pinned_resume_id") or attempt_accounts[vid].get("resume_hash", ""),
+                            reason_code="transport_unknown")
+                        self._add_log(state.short, state.color, state.status_detail, "warning")
+                        meta = state.vacancy_meta.get(vid, {})
+                        self._add_response(state, vid, meta.get("title", ""), meta.get("company", ""), "unknown")
+                        continue  # Still account for all other completed batch results.
 
                     if result == "sent":
                         state.sent += 1
@@ -2164,6 +3161,7 @@ class BotManager:
                             salary = f"{sal_from or '?'} - {sal_to or '?'}"
 
                         state.current_vacancy_title = title
+                        state.current_vacancy_id = vid
                         state.current_vacancy_company = company
                         self._push_action(state, f"✅ {title[:30]}")
 
@@ -2185,6 +3183,7 @@ class BotManager:
                         display_title = title[:40] if title else vid
 
                         if not (state.apply_tests or CONFIG.auto_apply_tests):
+                            cycle_outcome(state, vid, "skipped", "questionnaire_disabled")
                             # Откликаться на тесты выключено — пропускаем
                             state.tests += 1
                             add_test_vacancy(vid, title, company,
@@ -2197,8 +3196,22 @@ class BotManager:
                                                 title or vid, company, "пропущено")
                         else:
                             # Пробуем автозаполнить опрос
-                            q_result, q_info = asyncio.run(get_client(acc).fill_questionnaire(
+                            self._activity_vacancy(state, vid)
+                            set_activity(state, "questionnaire", "Обрабатывает анкету вакансии и проверяет результат",
+                                "Подтвердит отклик по ответу HH либо остановится для безопасной сверки",
+                                progress=(min(i + batch.index(vid), len(filtered)), len(filtered)), operation=(i, vid))
+                            questionnaire_cycle(state, vid)
+                            q_result, q_info = asyncio.run(get_client(attempt_accounts[vid]).fill_questionnaire(
                                 vid, vacancy_title=title, company=company))
+                            if q_result in ("sent", "already"):
+                                cycle_outcome(state, vid, q_result)
+                            elif q_result in ("error", "auth_error", "rate_limit", "challenge"):
+                                cycle_outcome(state, vid, "error")
+                            elif q_result == "unknown":
+                                cycle_outcome(state, vid, "unknown")
+                            else:
+                                cycle_outcome(state, vid, "skipped",
+                                    {"limit": "hh_limit", "cancelled": "cancelled"}.get(q_result, "questionnaire_incomplete"))
                             if q_result == "sent":
                                 state.sent += 1
                                 state.questionnaire_sent += 1
@@ -2207,6 +3220,7 @@ class BotManager:
                                 self._maybe_roll_daily_counter(state)
                                 state.daily_sent += 1
                                 state.current_vacancy_title = title
+                                state.current_vacancy_id = vid
                                 state.current_vacancy_company = company
                                 self._push_action(state, f"\U0001f4dd {display_title[:25]}")
                                 self._add_response(state, vid, title, company, "sent")
@@ -2218,6 +3232,13 @@ class BotManager:
                                 self._add_acc_event(state, "\U0001f4dd", "questionnaire",
                                                     title or vid, company,
                                                     f"Ответ: {answer_preview}")
+                            elif q_result == "already":
+                                # Receipt predating this attempt proves existence,
+                                # not a new application or today's conversion.
+                                state.already_applied += 1
+                                add_applied(acc["name"], vid,
+                                    {**state.vacancy_meta.get(vid, {}), **info}, confirmed=False)
+                                self._add_response(state, vid, title, company, "already")
                             elif q_result == "limit":
                                 state.limit_exceeded = True
                                 state.limit_reset_time = datetime.now() + timedelta(
@@ -2229,26 +3250,54 @@ class BotManager:
                                               f"\U0001f6ab ЛИМИТ при опросе! Повторная попытка в {state.limit_reset_time.strftime('%H:%M')}",
                                               "error")
                                 break
+                            elif q_result in ("rate_limit", "challenge"):
+                                self._hold_questionnaire_access(state, q_result)
+                                self._add_response(state, vid, title, company, "error")
+                                break
                             elif q_result == "auth_error":
                                 log_debug(f"AUTH_ERROR [{state.short}] vid={vid} flow=questionnaire")
-                                state.cookies_expired = True
-                                state.paused = True
+                                with state._state_lock:
+                                    state.cookies_expired = True
+                                    if not state.paused:
+                                        state.paused = True
+                                        state.paused_reason = "outcome_unknown" if state.pending_apply else "auth"
+                                self._persist_pauses()
                                 self._add_log(
                                     state.short, state.color,
                                     "⚠️ Куки протухли! Обновите куки и снимите паузу.", "error",
                                 )
                                 self._add_acc_event(state, "⚠️", "error", "Авторизация", "", "Обновите куки")
                                 break
+                            elif q_result == 'cancelled':
+                                continue
                             elif q_result == 'error':
+                                # The client uses 'error' only for a known failure
+                                # before submitting; no unknown write to reconcile.
+                                state.errors += 1
+                                state.consecutive_errors += 1
+                                self._add_response(state, vid, title, company, "error")
+                                self._add_log(state.short, state.color,
+                                    "Анкета не отправлена: не удалось подготовить форму. Проверьте подключение.", "warning")
+                                network_reason = self._network_reason(q_info)
+                                diagnostic_reason = q_info.get("reason") if isinstance(q_info, dict) else None
+                                if not isinstance(diagnostic_reason, str) or diagnostic_reason not in (
+                                        "proxy_error", "tls_error", "connect_timeout", "read_timeout", "timeout",
+                                        "connection_error", "network_error", "token_unavailable", "invalid_response",
+                                        "bridge_unavailable", "auth", "challenge", "access_denied", "rate_limit"):
+                                    diagnostic_reason = "unclassified_pre_submit_error"
+                                self._add_log(state.short, state.color,
+                                    "Причина подготовки анкеты: " + diagnostic_reason, "warning")
+                                self._check_auto_pause(state, network_reason=network_reason)
+                            elif q_result == 'unknown':
                                 # A transport/confirmation error does not mean
                                 # the applicant failed the employer's test.
-                                reason = q_info.get('error_code') or q_info.get('exception') or 'HTTP error'
                                 state.errors += 1
-                                state.paused = True
-                                state.paused_reason = 'manual'
-                                self._add_response(state, vid, title, company, 'error')
+                                self.hold_pending_apply(state, vid,
+                                    attempt_accounts[vid].get("_pinned_resume_id") or attempt_accounts[vid].get("resume_hash", ""),
+                                    flow="questionnaire", reason_code="questionnaire_unconfirmed")
+                                self._add_response(state, vid, title, company, q_result)
                                 self._add_log(state.short, state.color,
-                                              f'Анкета: результат не подтверждён ({reason}). Пауза: проверьте отклик в HH перед продолжением.', 'warning')
+                                              'Анкета: результат не подтверждён. Нужна сверка в HH; повторная отправка заблокирована.', 'warning')
                                 # Hold ambiguous submissions for manual review;
                                 # never blindly resend a potentially accepted form.
                                 add_test_vacancy(vid, title, company, acc['name'], acc.get('resume_hash', ''))
@@ -2284,7 +3333,8 @@ class BotManager:
                             # paused_reason="limit" — чтобы _maybe_roll_daily_counter
                             # автоматически снял паузу в полночь МСК. Без этого
                             # бот сидел на паузе несколько дней подряд (bug fix).
-                            state.paused_reason = "limit"
+                            if not state.pending_apply:
+                                state.paused_reason = "limit"
                             state.status = "limit"
                             state.status_detail = "\U0001f6d1 Лимит HH — остановлен до 00:00 МСК"
                             self._add_log(
@@ -2305,6 +3355,10 @@ class BotManager:
                             )
                         break
 
+                    elif result in ("rate_limit", "challenge"):
+                        self._hold_questionnaire_access(state, result)
+                        self._add_response(state, vid, "", "", "error")
+                        break
                     elif result == "auth_error":
                         oauth_capable = (
                             state.use_oauth
@@ -2330,6 +3384,9 @@ class BotManager:
                             log_debug(f"AUTH_ERROR [{state.short}] vid={vid} flow=apply")
                             state.cookies_expired = True
                             state.paused = True
+                            if not state.pending_apply:
+                                state.paused_reason = "auth"
+                            self._persist_pauses()
                             self._add_log(
                                 state.short, state.color,
                                 "⚠️ Куки протухли! Обновите куки и снимите паузу.", "error",
@@ -2365,10 +3422,18 @@ class BotManager:
 
                 i += batch_size
                 if i < len(filtered):
+                    set_activity(state, "wait_between_batches", "Выдерживает интервал между пакетами откликов",
+                        "Проверит ограничения перед обработкой следующего пакета",
+                        progress=(min(i, len(filtered)), len(filtered)),
+                        wait_until=datetime.now(timezone.utc) + timedelta(seconds=CONFIG.response_delay))
                     time.sleep(CONFIG.response_delay)
 
+            finish_cycle(state, "blocked" if (self.paused or state.paused
+                or state.limit_exceeded or state.hard_stopped or state._deleted
+                or self._stop_event.is_set()) else "waiting")
             # Очистка
             state.current_vacancy_title = ""
+            state.current_vacancy_id = ""
             state.current_vacancy_company = ""
             if state.short in self.vacancy_queues:
                 self.vacancy_queues[state.short] = {
@@ -2377,7 +3442,7 @@ class BotManager:
                     "color": state.color,
                 }
 
-            if not state.limit_exceeded:
+            if not state.limit_exceeded and not state.paused:
                 state.status = "waiting"
                 state.status_detail = "Цикл завершён"
                 self._add_log(
@@ -2385,6 +3450,11 @@ class BotManager:
                     f"⏳ Цикл завершён, пауза {CONFIG.pause_between_cycles}с",
                     "info",
                 )
+                reserve_wait = state.activity.get("phase") == "fresh_reserve"
+                set_activity(state, "fresh_reserve" if reserve_wait else "cycle_wait",
+                    "Ожидает свежие вакансии: действует резерв откликов" if reserve_wait else "Цикл обработки завершён; ожидает следующего поиска",
+                    "Снова загрузит вакансии и проверит новые предложения",
+                    wait_until=datetime.now(timezone.utc) + timedelta(seconds=CONFIG.pause_between_cycles))
                 if self._stop_event.wait(CONFIG.pause_between_cycles):
                     return
 
@@ -2484,7 +3554,10 @@ class BotManager:
         collector. Also writes has_test / response_letter_required into vacancy_meta so
         the apply loop can skip vacancies we can't fulfil without cookies.
         """
-        acc = state.acc
+        acc = dict(state.acc)
+        acc['_search_guard'] = lambda: (not state._deleted and not getattr(state, 'paused', False)
+            and not getattr(self, 'paused', False)
+            and not (getattr(self, '_stop_event', None) and self._stop_event.is_set()))
         effective_urls = acc.get("urls") or [_url_entry(u)["url"] for u in CONFIG.url_pool]
         results_by_url = {url: [] for url in effective_urls}
         salary_map: dict = {}
@@ -2495,7 +3568,7 @@ class BotManager:
         # browser_sessions/url_pool overrides must not silently request more
         # pages than the value currently shown in Settings.
         try:
-            configured_pages = max(1, min(int(CONFIG.pages_per_url), 20))
+            configured_pages = max(1, min(int(CONFIG.pages_per_url), 100))
         except (TypeError, ValueError):
             configured_pages = 1
         total_pages = len(effective_urls) * configured_pages
@@ -2504,7 +3577,7 @@ class BotManager:
             f"urls={len(effective_urls)}"
         )
         # Translate one search URL → OAuth API request
-        for url in effective_urls:
+        for search_index, url in enumerate(effective_urls):
             pages = configured_pages
             text, area, query = parse_search_url(url)
             query = _mobile_search_filters(query)
@@ -2512,14 +3585,29 @@ class BotManager:
             if state._deleted:
                 break
             try:
+                set_activity(state, "collect", "Загружает вакансии по поисковым запросам HH",
+                    "Проверит результаты и исключит уже обработанные вакансии",
+                    progress=(search_index, len(effective_urls)))
                 # Ограничение передаём внутрь клиента: он не должен сначала
                 # загрузить 20 страниц, а затем выбросить лишние результаты.
                 items = get_client(acc).search_vacancies(
                     text, area_id=area, per_page=50, page=0, filters=query,
                     max_pages=pages)
+                pagination = getattr(items, 'pagination', None)
+                if isinstance(pagination, dict):
+                    with getattr(state, '_state_lock', nullcontext()):
+                        report = getattr(state, '_cycle_report', None)
+                        if report is not None:
+                            report['search_pages_loaded'] = report.get('search_pages_loaded', 0) + pagination['pages_loaded']
+                            if pagination['stop_reason'] != 'end':
+                                report['partial'] = True
+                                report['search_stop_reasons'] = list(set(report.get('search_stop_reasons', [])) | {pagination['stop_reason']})
                 # Defensive cap для сторонних реализаций контракта.
                 items = items[:pages * 50]
-                completed += pages
+                set_activity(state, "collect", "Загружает вакансии по поисковым запросам HH",
+                    "Проверит результаты и исключит уже обработанные вакансии",
+                    progress=(search_index + 1, len(effective_urls)))
+                completed += pagination['pages_loaded'] if pagination else pages
                 state.status_detail = f"OAuth-сбор {min(completed, total_pages)}/{total_pages}"
                 for it in items:
                     vid = str(it.get("id") or "")
@@ -2528,6 +3616,7 @@ class BotManager:
                     ids_for_url.add(vid)
                     # Build meta entry — mirror parse_vacancy_meta shape
                     meta_entry = state.vacancy_meta.setdefault(vid, {})
+                    meta_entry.update(scope_metadata(it))
                     meta_entry["title"] = it.get("name", "") or meta_entry.get("title", "")
                     emp = it.get("employer") or {}
                     meta_entry["company"] = emp.get("name", "") or meta_entry.get("company", "")
@@ -2542,15 +3631,18 @@ class BotManager:
                         it.get("immediate_redirect_vacancy_id") or ""
                     )
                     meta_entry["is_adv"] = bool(it.get("is_adv"))
-                    sal = it.get("salary")
-                    if isinstance(sal, dict):
-                        salary_map[vid] = sal.get("from") or sal.get("to")
+                    meta_entry.pop("skills_match_percent", None)
+                    meta_entry.update(normalize_vacancy_signals(it))
+                    salary_map[vid] = salary_for_ruble_threshold(it)
                     sch = it.get("schedule")
                     if isinstance(sch, dict) and sch.get("id"):
                         schedule_map.setdefault(vid, set()).add(sch["id"])
             except Exception as e:
+                cycle_operation_error(state)
                 log_debug(f"OAuth collect error [{state.short}]: {e}")
             results_by_url[url] = ids_for_url
+        from app.vacancy_history import observe
+        observe(state.vacancy_meta)
         return results_by_url, salary_map, schedule_map
 
     async def _collect_all_urls_parallel(self, state: AccountState) -> tuple:
@@ -2588,19 +3680,20 @@ class BotManager:
         acc_url_pages = acc.get("url_pages", {})  # per-account override
         effective_urls = acc.get("urls") or [_url_entry(u)["url"] for u in CONFIG.url_pool]
         # Build extra search filter params from config
-        # Note: HH only accepts ONE label param; low_competition takes priority
         extra_params = ""
         if CONFIG.filter_low_competition:
             extra_params += "&label=low_performance"
-        elif CONFIG.filter_agencies:
+        if CONFIG.filter_agencies:
             extra_params += "&label=not_from_agency"
         if CONFIG.search_period_days > 0:
             extra_params += f"&search_period={CONFIG.search_period_days}"
         for url_idx, url in enumerate(effective_urls):
-            pages = acc_url_pages.get(url) or url_pages.get(url, CONFIG.pages_per_url)
+            pages = max(1, min(int(acc_url_pages.get(url) or url_pages.get(url, CONFIG.pages_per_url)), 100))
             sep = "&" if "?" in url else "?"
             for page in range(pages):
                 page_url = f"{url}{sep}page={page}{extra_params}"
+                if CONFIG.remote_it_only:
+                    page_url = remote_it_url(page_url)
                 all_tasks.append((url_idx, url, page, page_url))
 
         total_tasks = len(all_tasks)
@@ -2609,6 +3702,9 @@ class BotManager:
         completed = 0
 
         # connector передаётся явно — ClientSession его НЕ закрывает,
+        set_activity(state, "collect", "Загружает страницы поиска HH",
+            "Проверит результаты и исключит уже обработанные вакансии",
+            progress=(0, total_tasks))
         # нужен ручной close, иначе утечка socket'ов на каждый цикл (swarm-11 #1).
         async with aiohttp.ClientSession(
             headers=headers, cookies=acc["cookies"], connector=connector,
@@ -2625,7 +3721,11 @@ class BotManager:
                 html = await fetch_page(session, page_url, sem, collect_req_kw)
                 completed += 1
                 state.status_detail = f"Загрузка {completed}/{total_tasks}"
+                set_activity(state, "collect", "Загружает страницы поиска HH",
+                    "Проверит результаты и исключит уже обработанные вакансии",
+                    progress=(completed, total_tasks))
                 if html and _is_login_page(html):
+                    cycle_operation_error(state)
                     if not (state.use_oauth or CONFIG.use_oauth_apply):
                         log_debug(f"AUTH_ERROR [{state.short}] vid=- flow=collect")
                         state.cookies_expired = True
@@ -2649,17 +3749,48 @@ class BotManager:
                         else:
                             meta[vid] = sm
                     return url, ids, salaries, meta, schedules
+                cycle_operation_error(state)
                 log_debug(
                     f"COLLECT_PAGE empty [{state.short}] mode=web "
                     f"page={page + 1} url={page_url}"
                 )
                 return url, set(), {}, {}, {}
 
-            tasks = [
-                fetch_one(url_idx, url, page, page_url)
-                for url_idx, url, page, page_url in all_tasks
-            ]
-            task_results = await asyncio.gather(*tasks, return_exceptions=True)
+            # Searches can run in parallel; pages within a search must not:
+            # stop on empty/repeated results instead of scheduling 100 at once.
+            async def fetch_search(url):
+                rows, seen = [], set()
+                stop_reason = 'configured_limit'
+                loaded = 0
+                for args in (task for task in all_tasks if task[1] == url):
+                    if state._deleted or getattr(state, 'paused', False) or getattr(self, 'paused', False) or (
+                            getattr(self, '_stop_event', None) and self._stop_event.is_set()):
+                        stop_reason = 'cancelled'
+                        break
+                    result = await fetch_one(*args)
+                    loaded += 1
+                    ids = set(result[1])
+                    if not ids or ids <= seen:
+                        stop_reason = 'empty_page' if not ids else 'repeated_page'
+                        break
+                    seen.update(ids)
+                    rows.append(result)
+                with getattr(state, '_state_lock', nullcontext()):
+                    report = getattr(state, '_cycle_report', None)
+                    if report is not None:
+                        report['search_pages_loaded'] = report.get('search_pages_loaded', 0) + loaded
+                        report['partial'] = True  # Empty HTML alone does not prove the server's last page.
+                        report['search_stop_reasons'] = list(set(report.get('search_stop_reasons', [])) | {stop_reason})
+                return rows
+
+            groups = await asyncio.gather(*(fetch_search(url) for url in results_by_url), return_exceptions=True)
+            task_results = []
+            for group in groups:
+                if isinstance(group, Exception):
+                    cycle_operation_error(state)
+                    task_results.append(group)
+                else:
+                    task_results.extend(group)
 
             schedule_map = {}
             for result in task_results:
@@ -2674,6 +3805,8 @@ class BotManager:
                     if sched_set:
                         schedule_map.setdefault(vid, set()).update(sched_set)
 
+        from app.vacancy_history import observe
+        await asyncio.to_thread(observe, state.vacancy_meta)
         return {url: set(ids) for url, ids in results_by_url.items()}, salary_map, schedule_map
 
     def _process_llm_replies(self, state: AccountState) -> None:
@@ -2705,6 +3838,9 @@ class BotManager:
 
     def _process_llm_replies_inner(self, state: AccountState) -> None:
         """Inner implementation — called only when _llm_lock is held."""
+        self._bind_mutation_guard(state)
+        if not self._can_mutate(state):
+            return
         replied = 0
 
         # Sync _llm_no_chat from persisted DB (catches 409 failures from previous sessions)
@@ -2862,12 +3998,15 @@ class BotManager:
         self._add_log(state.short, state.color, f"\U0001f916 LLM: {len(candidates)} чатов требуют ответа", "info")
 
         for i, neg_id in enumerate(cycle):
-            if not state.llm_enabled or not CONFIG.llm_enabled:
+            if not self._can_mutate(state) or not state.llm_enabled or not CONFIG.llm_enabled:
                 self._add_log(state.short, state.color, f"\U0001f916 LLM: выключен в процессе цикла, прерываю", "warning")
                 break
             # Reset per-iteration: иначе exception на новой итерации видит global_key из ПРЕДЫДУЩЕЙ.
             global_key = None
             try:
+                from app.message_quarantine import blocked as chat_blocked
+                if chat_blocked(state.acc, neg_id):
+                    continue
                 if neg_id in state._llm_no_chat:
                     item = items_by_id.get(neg_id, {})
                     info = display_info.get(str(neg_id), {})
@@ -3019,6 +4158,10 @@ class BotManager:
                 _text_buttons = _raw_actions.get("text_buttons", [])
                 _is_bot_msg = (_last_emp_raw or {}).get("is_bot", False)
                 if _text_buttons:
+                    # Draft mode covers workflow actions as well as ordinary text.
+                    # Never put button captions in the sendable text-draft cache.
+                    if not CONFIG.llm_auto_send and key in state._llm_robot_drafts:
+                        continue
                     # Умный выбор кнопки: heuristic для очевидных Да/Нет,
                     # LLM-консультация если кнопок 3+ или Да/Нет не определяется.
                     from app.llm import pick_robot_button as _pick_robot_button
@@ -3036,6 +4179,21 @@ class BotManager:
                     upsert_interview(neg_id, acc=state.short, acc_color=state.color,
                                      employer=employer_short, vacancy_title=vacancy_title, vacancy_id=vacancy_id,
                                      chat_status="robot")
+                    if not CONFIG.llm_auto_send:
+                        state._llm_robot_drafts.add(key)
+                        self._add_log(state.short, state.color,
+                            f"🤖 Черновик кнопки [{employer_short}]: {btn_text}. Не отправлено; подтвердите действие в чате.",
+                            "info", neg_id=neg_id)
+                        self._push_llm_log({
+                            "time": datetime.now().strftime("%d.%m %H:%M"),
+                            "acc": state.short, "color": state.color,
+                            "employer": employer_short, "vacancy_title": vacancy_title,
+                            "neg_id": neg_id, "vacancy_id": vacancy_id,
+                            "employer_msg": employer_msg,
+                            "bot_reply": f"Кнопка: {btn_text} (не отправлено)",
+                            "sent": False, "source": "robot_draft",
+                        })
+                        continue
                     # Аудит 2026-08-17 #10: раньше robot-flow отправлял сразу без
                     # резервации global_key → под конкурентными циклами двух
                     # аккаунтов один и тот же workflow_button слался дважды.
@@ -3073,7 +4231,12 @@ class BotManager:
                                 or _event.get("eventType")
                                 or _event.get("type")
                             )
-                        _client = get_client(state.acc)
+                        _client = get_client({**state.acc, "_mutation_guard": lambda: self._can_mutate(state, llm=True)})
+                        # Settings can change while the picker is running.
+                        if not self._can_mutate(state, llm=True):
+                            with self._llm_sent_lock:
+                                self._llm_sent_global.discard(global_key)
+                            continue
                         if _event:
                             ok = _client.send_workflow_event(
                                 neg_id, str(_event),
@@ -3086,6 +4249,7 @@ class BotManager:
                             self._llm_sent_global.discard(global_key)
                         raise
                     if ok and ok != "chat_not_found":
+                        state._llm_robot_drafts.discard(key)
                         state.llm_replied_msgs[key] = None
                         replied += 1
                         # Аудит #22: persist llm_sent+replied_msg_id, чтобы после
@@ -3251,8 +4415,24 @@ class BotManager:
                         pass
                     _delay = min(4.0, max(2.0, len(reply_text) * 0.03))
                     time.sleep(_delay)
+                    if not self._can_mutate(state, llm=True):
+                        with self._llm_sent_lock:
+                            self._llm_sent_global.discard(global_key)
+                            self._llm_sent_by_neg_id.get(neg_id, set()).discard(global_key)
+                        with state._llm_drafts_lock:
+                            state._llm_drafts[key] = reply_text
+                        try:
+                            get_client(state.acc).send_participant_action(neg_id, "NONE")
+                        except Exception:
+                            pass
+                        continue
                     log_debug(f"LLM [{state.short}] {neg_id}: отправляю сообщение в chatik")
-                    ok = get_client(state.acc).send_message(neg_id, reply_text, topic_id=thread.get("topic_id", ""))
+                    sender = get_client({**state.acc, "_mutation_guard": lambda: self._can_mutate(state, llm=True)})
+                    if not self._can_mutate(state, llm=True):
+                        with self._llm_sent_lock:
+                            self._llm_sent_global.discard(global_key)
+                        continue
+                    ok = sender.send_message(neg_id, reply_text, topic_id=thread.get("topic_id", ""))
                     try:
                         get_client(state.acc).send_participant_action(neg_id, "NONE")
                     except Exception:
@@ -3354,13 +4534,22 @@ class BotManager:
 
                 time.sleep(3)  # rate limit between messages
             except Exception as e:
+                if getattr(e, "outcome_unknown", False):
+                    from app.message_quarantine import retain as retain_chat
+                    try:
+                        retain_chat(state.acc, neg_id)
+                        self._add_log(state.short, state.color,
+                            "Результат сообщения неизвестен: этот чат изолирован без повторной отправки. Другие чаты и отклики продолжаются.",
+                            "warning", neg_id=neg_id)
+                    except Exception:
+                        # A failed durable exclusion must still stop all writes.
+                        state.paused = True
+                        if not state.pending_apply:
+                            state.paused_reason = "message_outcome_unknown"
+                        state.status_detail = "Не удалось сохранить блокировку чата; нужна ручная проверка"
+                        self._persist_pauses()
+                        self._add_log(state.short, state.color, state.status_detail, "warning", neg_id=neg_id)
                 log_exception(f"_process_llm_replies {neg_id}", e)
-            finally:
-                # Аудит 2026-08-17 #34: pending_chats раньше держал начальное
-                # число кандидатов до конца цикла — UI показывал «12 висят» уже
-                # после того, как 10 обработано. Декрементим по факту, чтобы
-                # прогресс был виден в реальном времени.
-                state.llm_pending_chats = max(0, state.llm_pending_chats - 1)
                 try:
                     # Чистим только текущий global_key. На иммедиатных exception'ах
                     # (до reserve блока) он = None — ничего не трогаем.
@@ -3381,6 +4570,8 @@ class BotManager:
                 state._llm_neg_failures[neg_id] = fail_count
                 backoff = {1: 300, 2: 900, 3: 3600, 4: 3600, 5: 3600}.get(fail_count, 86400)
                 state._llm_temp_skip[(neg_id, "exception")] = time.time() + backoff
+            finally:
+                state.llm_pending_chats = max(0, state.llm_pending_chats - 1)
 
         state.llm_replied_count += replied
         if replied:

@@ -34,8 +34,6 @@ def test_toggle_account_pause_sets_and_clears_manual_reason(monkeypatch):
     assert state.paused is True
     assert state.paused_reason == "manual"
 
-    state.hard_stopped = True
-    state.limit_exceeded = True
     state.consecutive_errors = 4
     mgr.toggle_account_pause(0)
     assert state.paused is False
@@ -43,3 +41,12 @@ def test_toggle_account_pause_sets_and_clears_manual_reason(monkeypatch):
     assert state.hard_stopped is False
     assert state.limit_exceeded is False
     assert state.consecutive_errors == 0
+
+    # A subsequent user pause cannot be used to bypass a protective limit.
+    mgr.toggle_account_pause(0)
+    state.hard_stopped = True
+    state.limit_exceeded = True
+    mgr.toggle_account_pause(0)
+    assert state.paused is True
+    assert state.hard_stopped is True
+    assert state.limit_exceeded is True

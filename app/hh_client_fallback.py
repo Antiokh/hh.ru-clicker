@@ -92,7 +92,7 @@ _METHODS = (
 # таких методов допустим лишь при явном отказе авторизации (401/403).
 _MUTATING_METHODS = {
     "send_message", "send_workflow_event", "send_participant_action",
-    "mark_chat_read", "auto_decline_discards", "submit_response",
+    "mark_chat_read", "auto_decline_discards", "submit_response", "fill_questionnaire",
     "touch_resume", "edit_resume_field", "set_job_search_status",
 }
 
@@ -137,6 +137,8 @@ def _make_async_delegate(name: str):
             return await getattr(self.web, name)(*args, **kwargs)
         except MobileAPIError as e:
             if not is_fallback_status(e.status_code):
+                raise
+            if name in _MUTATING_METHODS and (e.status_code == 0 or e.status_code >= 500):
                 raise
             log_debug(
                 f"FallbackHHClient.{name}: mobile HTTP {e.status_code} — "

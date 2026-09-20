@@ -33,6 +33,7 @@ CONFIG.default_client_mode (дефолт "web").
 """
 
 import json
+import copy
 import threading
 from pathlib import Path
 
@@ -56,6 +57,7 @@ ACCOUNTS_FILE = DATA_DIR / "accounts.json"
 # Защищаем write+rename последовательность от конкурентных вызовов из разных потоков.
 _config_write_lock = threading.Lock()
 _accounts_write_lock = threading.Lock()
+_accounts_schedule_lock = threading.Lock()
 
 
 # ============================================================
@@ -72,7 +74,8 @@ accounts_data: list = []
 
 class Config:
     """Глобальные настройки (можно менять в runtime)"""
-    pages_per_url = 40
+    pages_per_url = 100  # Maximum safety budget; API stops at the reported end.
+    automation_paused: bool = False
     max_concurrent = 20
     response_delay = 1
     pause_between_cycles = 60
@@ -95,6 +98,7 @@ class Config:
     # Фильтр по формату работы (пустой = без фильтра, все форматы)
     # Возможные значения: "fullDay", "remote", "flexible", "shift", "flyInFlyOut"
     allowed_schedules: list = []
+    remote_it_only: bool = False
     # Фильтр по заголовку вакансии. Пустой include = все заголовки разрешены.
     # Сравнение регистронезависимое, по вхождению подстроки.
     title_include_keywords: list = []
@@ -150,6 +154,7 @@ class Config:
     # для proactive limit-tracker. 0 = выкл (старое поведение по daily_apply_limit).
     hh_daily_limit: int = 200
     fresh_vacancies_mode: bool = False  # резервировать часть лимита для новых вакансий
+    prefer_hh_signals: bool = False    # внутри категории свежести: менеджер онлайн, затем совпадение навыков
     fresh_vacancy_hours: int = 24       # возраст вакансии для категории «свежая»
     fresh_apply_reserve: int = 50       # сколько последних откликов не тратить на старые
     llm_fill_questionnaire: bool = False  # Использовать LLM для заполнения опросников
@@ -257,14 +262,14 @@ def _url_pages_map() -> dict:
 
 
 _CONFIG_KEYS = [
-    "pages_per_url", "max_concurrent", "response_delay", "pause_between_cycles",
+    "pages_per_url", "max_concurrent", "response_delay", "pause_between_cycles", "remote_it_only",
     "limit_check_interval", "resume_touch_interval", "batch_responses", "min_salary",
     "auto_pause_errors", "questionnaire_default_answer", "llm_fill_questionnaire",
     "skip_inconsistent", "use_oauth_apply", "auto_pick_resume", "default_client_mode", "daily_apply_limit", "stop_on_hh_limit", "llm_check_interval",
     "filter_agencies", "filter_low_competition", "search_period_days",
     "min_employer_rating", "min_employer_reviews", "min_recommendations_percent",
     "skip_auto_response_vacancies", "prefer_quick_responses", "accredited_it_only",
-    "hh_daily_limit", "fresh_vacancies_mode", "fresh_vacancy_hours", "fresh_apply_reserve",
+    "hh_daily_limit", "fresh_vacancies_mode", "fresh_vacancy_hours", "fresh_apply_reserve", "prefer_hh_signals", "automation_paused",
     "hh_region", "llm_applicant_gender", "llm_auto_send", "llm_enabled",
     "llm_ws_push_enabled", "use_websocket_realtime", "chat_use_oauth", "llm_use_quick_replies",
     "hh_ai_letter_first_try", "related_vacancies_enabled", "hh_proxy_url",
@@ -472,29 +477,35 @@ def load_config():
         log_debug(f"load_config error: {e}")
 
 
-def save_accounts():
-    """Сохранить accounts_data на диск (в фоновом потоке)."""
-    snapshot = [
-        {k: v for k, v in acc.items() if not k.startswith("_")}
-        for acc in accounts_data
-    ]
-    target_file = ACCOUNTS_FILE
-    def _write():
-        with _accounts_write_lock:
-            tmp = target_file.with_suffix(".tmp")
-            try:
-                with open(tmp, "w", encoding="utf-8") as f:
-                    json.dump(snapshot, f, ensure_ascii=False, indent=2, default=str)
-                tmp.replace(target_file)
+def save_accounts(*, wait: bool = False):
+    """Save an isolated snapshot; wait=True is a durable, fail-closed barrier.
+
+    Both modes use the same ordered queue, so an older asynchronous snapshot
+    cannot overwrite a synchronously reserved receipt-check attempt.
+    """
+    # Lazy import also avoids the config/storage initialization cycle fallback.
+    from app.storage import _atomic_write_json, _schedule_save as schedule_save
+
+    with _accounts_schedule_lock:
+        snapshot = copy.deepcopy([
+            {k: v for k, v in acc.items() if not k.startswith("_")}
+            for acc in accounts_data
+        ])
+        target_file = ACCOUNTS_FILE
+
+        def _write():
+            with _accounts_write_lock:
                 try:
-                    import os as _os
-                    _os.chmod(target_file, 0o600)  # cookies — owner-only
-                except Exception:
-                    pass
-            except Exception as e:
-                log_debug(f"save_accounts error: {e}")
-                tmp.unlink(missing_ok=True)
-    (_schedule_save(_write) if _schedule_save else threading.Thread(target=_write, daemon=True).start())
+                    _atomic_write_json(target_file, snapshot)
+                except Exception as exc:
+                    log_debug(f"save_accounts error: {type(exc).__name__}")
+                    if wait:
+                        raise
+
+        if wait:
+            schedule_save(_write, wait=True)
+        else:
+            schedule_save(_write)
 
 
 def load_accounts():

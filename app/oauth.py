@@ -17,6 +17,7 @@ import requests
 from app.logging_utils import log_debug
 from app.config import CONFIG
 from app.hh_http import HH
+from app.mutation_safety import ensure_mutation_allowed, MutationBlocked, OutcomeUnknown
 from app.mobile_auth import MobileAuthError
 from app.user_agent import mobile_user_agent
 
@@ -1073,6 +1074,7 @@ def _oauth_apply(acc: dict, vid: str, message: str = "") -> tuple:
         data = {"vacancy_id": vid, "resume_id": resume_hash_quoted}
         if message:
             data["message"] = message
+        ensure_mutation_allowed(acc)
         r = HH.post(
             "https://api.hh.ru/negotiations",
             headers={"User-Agent": _mobile_user_agent(), "Authorization": f"Bearer {token}",
@@ -1084,10 +1086,13 @@ def _oauth_apply(acc: dict, vid: str, message: str = "") -> tuple:
             info = {}
             try:
                 d = r.json()
+                if not isinstance(d, dict) or "errors" in d or (r.status_code == 200 and "id" not in d):
+                    return "unknown", {"reason": "unrecognized_apply_response"}
                 info = {"title": d.get("vacancy", {}).get("name", ""),
                         "company": d.get("vacancy", {}).get("employer", {}).get("name", "")}
             except Exception:
-                pass
+                if r.status_code not in (201, 204) or r.content:
+                    return "unknown", {"reason": "invalid_apply_response"}
             return "sent", info
         elif r.status_code == 400:
             try:
@@ -1147,12 +1152,14 @@ def _oauth_apply(acc: dict, vid: str, message: str = "") -> tuple:
             except (ValueError, TypeError):
                 pass
             return "limit", {"retry_after": retry_after}
-        elif r.status_code in (502, 503, 504):
-            return "error", {"raw": f"HH transient {r.status_code}", "transient": True}
+        elif r.status_code >= 500:
+            return "unknown", {"http_status": r.status_code}
         else:
             return "error", {"raw": f"HTTP {r.status_code}: {r.text[:100]}"}
+    except MutationBlocked:
+        return "cancelled", {}
     except Exception as e:
-        return "error", {"exception": str(e)}
+        return "unknown", {"exception": str(e)}
 
 
 def _oauth_touch_resume(acc: dict) -> tuple:
@@ -1163,17 +1170,24 @@ def _oauth_touch_resume(acc: dict) -> tuple:
     resume_hash = acc.get("resume_hash", "")
     try:
         resume_hash_quoted = urllib.parse.quote(resume_hash, safe="")
+        ensure_mutation_allowed(acc)
         r = HH.post(
             f"https://api.hh.ru/resumes/{resume_hash_quoted}/publish",
             headers={"User-Agent": _mobile_user_agent(), "Authorization": f"Bearer {token}"},
             cookie_jar_key=_token_key(acc) or None, timeout=15,
         )
+        if r.status_code >= 500:
+            raise OutcomeUnknown("Неизвестен результат обновления резюме")
         if r.status_code in (200, 204):
             return True, "✅ Резюме поднято через OAuth API!"
         elif r.status_code == 429:
             return False, "Кулдаун (429) — подождите 4 часа"
         else:
             return False, f"HTTP {r.status_code}: {r.text[:100]}"
+    except (MutationBlocked, OutcomeUnknown):
+        raise
+    except requests.RequestException as e:
+        raise OutcomeUnknown("Неизвестен результат обновления резюме") from e
     except Exception as e:
         return False, f"Ошибка: {str(e)[:50]}"
 
@@ -1232,12 +1246,15 @@ def send_negotiation_message_oauth(acc: dict, neg_id, text: str) -> bool:
     if not H:
         return False
     try:
+        ensure_mutation_allowed(acc)
         r = HH.post(
             f"https://api.hh.ru/negotiations/{neg_id}/messages",
             headers={**H, "Content-Type": "application/json"},
             json={"message": text}, cookie_jar_key=_token_key(acc) or None, timeout=15,
         )
         log_debug(f"OAuth /negotiations send neg={neg_id}: HTTP {r.status_code} | {r.text[:200]}")
+        if r.status_code >= 500:
+            raise OutcomeUnknown("Неизвестен результат отправки сообщения")
         if r.status_code in (200, 201, 204):
             return True
         if r.status_code == 401 or (r.status_code == 403 and _is_403_auth_related(r)):
@@ -1249,6 +1266,10 @@ def send_negotiation_message_oauth(acc: dict, neg_id, text: str) -> bool:
             if rh:
                 invalidate_oauth_token(rh, acc)
         return False
+    except (MutationBlocked, OutcomeUnknown):
+        raise
+    except requests.RequestException as e:
+        raise OutcomeUnknown("Неизвестен результат отправки сообщения") from e
     except Exception as e:
         log_debug(f"OAuth /negotiations send neg={neg_id} error: {e}")
         return False
@@ -1281,6 +1302,7 @@ def send_chat_message_oauth(acc: dict, chat_id, text: str, is_automated: bool = 
         "is_automated": bool(is_automated),
     }
     try:
+        ensure_mutation_allowed(acc)
         r = HH.post(
             f"https://api.hh.ru/common/chats/{cid}/messages",
             json=payload,
@@ -1293,6 +1315,8 @@ def send_chat_message_oauth(acc: dict, chat_id, text: str, is_automated: bool = 
             cookie_jar_key=_token_key(acc) or None, timeout=15,
         )
         log_debug(f"OAuth chat send chat_id={cid}: HTTP {r.status_code} | {r.text[:300]}")
+        if r.status_code >= 500:
+            raise OutcomeUnknown("Неизвестен результат отправки сообщения")
         if r.status_code in (200, 201, 204):
             return True
         if r.status_code == 404:
@@ -1329,6 +1353,10 @@ def send_chat_message_oauth(acc: dict, chat_id, text: str, is_automated: bool = 
                 return "chat_not_found"
             return False
         return False
+    except (MutationBlocked, OutcomeUnknown):
+        raise
+    except requests.RequestException as e:
+        raise OutcomeUnknown("Неизвестен результат отправки сообщения") from e
     except Exception as e:
         log_debug(f"OAuth chat send chat_id={cid} error: {e}")
         return False

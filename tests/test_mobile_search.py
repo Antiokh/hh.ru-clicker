@@ -6,6 +6,37 @@ from app.mobile_search import search_vacancies
 ACC = {"resume_hash": "rh"}
 
 
+def test_optional_skills_match_is_forwarded_and_retried_only_once(monkeypatch):
+    from app.hh_mobile_transport import MobileAPIError
+    calls = []
+
+    def request(acc, method, endpoint, params):
+        calls.append(dict(params))
+        if len(calls) == 1:
+            raise MobileAPIError(403)
+        return {"pages": 1, "items": [{"id": "synthetic"}]}
+
+    monkeypatch.setattr("app.mobile_search.mobile_request", request)
+    result = search_vacancies({}, "", filters={"resume": "r", "with_skills_match": "true"})
+    assert result[0]["id"] == "synthetic"
+    assert [p["with_skills_match"] for p in calls] == ["true", "false"]
+
+
+def test_optional_skills_failure_does_not_swallow_base_search_error(monkeypatch):
+    import pytest
+    from app.hh_mobile_transport import MobileAPIError
+    calls = []
+
+    def request(acc, method, endpoint, params):
+        calls.append(dict(params))
+        raise MobileAPIError(403)
+
+    monkeypatch.setattr("app.mobile_search.mobile_request", request)
+    with pytest.raises(MobileAPIError):
+        search_vacancies({}, "", filters={"with_skills_match": "true"})
+    assert len(calls) == 2
+
+
 @responses.activate
 def test_search_paginates_normalises_and_sends_mobile_headers(monkeypatch):
     monkeypatch.setattr("app.oauth._obtain_oauth_token", lambda acc: "token")
@@ -33,13 +64,13 @@ def test_search_paginates_normalises_and_sends_mobile_headers(monkeypatch):
 
 
 @responses.activate
-def test_search_stops_after_twenty_pages(monkeypatch):
+def test_search_explicit_twenty_page_budget(monkeypatch):
     monkeypatch.setattr("app.oauth._obtain_oauth_token", lambda acc: "token")
     for page in range(20):
         responses.get("https://api.hh.ru/vacancies", json={
             "pages": 99, "items": [{"id": str(page)}],
         })
-    assert len(search_vacancies(ACC, "x")) == 20
+    assert len(search_vacancies(ACC, "x", max_pages=20)) == 20
     assert len(responses.calls) == 20
 
 

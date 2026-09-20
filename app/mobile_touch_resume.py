@@ -56,7 +56,7 @@ def touch_resume(acc: dict, resume_id: str) -> tuple:
                        f"/resumes/{quote(resume_id, safe='')}/publish",
                        params={"with_professional_roles": "true"})
     except MobileAPIError as e:
-        if is_fallback_status(e.status_code):
+        if e.outcome_unknown or is_fallback_status(e.status_code):
             # Не глотим: fallback-обёртка повторит вызов через web-flow.
             raise
         payload_text = str(e.payload).lower()

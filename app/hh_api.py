@@ -15,22 +15,30 @@ from app.config import CONFIG, hh_base
 
 def fetch_hh_vacancies(acc: dict, text: str, area_id=113, per_page: int = 20,
                        page: int = 0, filters=None,
-                       max_pages: int = 20) -> list[dict]:
+                       max_pages: int = 100) -> list[dict]:
     """Cookie/SSR vacancy-search fallback with the mobile result shape.
 
     This deliberately uses the existing HTML parsers; it does not call the
     public API and therefore remains useful when OAuth is unavailable.
     """
     from app.hh_http import HH
+    from app.mobile_search import SearchResults
 
     params = dict(filters or {})
     params.update({"text": text, "area": area_id, "items_on_page": per_page})
+    if area_id is None:
+        params.pop('area', None)
     cookies = acc.get("cookies", {}) or {}
     headers = get_headers(cookies.get("_xsrf", ""))
-    out = []
+    out = SearchResults()
+    seen = set()
     start_page = max(0, int(page))
-    request_limit = max(0, min(int(max_pages), 20))
+    request_limit = max(0, min(int(max_pages), 100))
     for current in range(start_page, start_page + request_limit):
+        guard = acc.get('_search_guard')
+        if callable(guard) and not guard():
+            out.pagination['stop_reason'] = 'cancelled'
+            break
         params["page"] = current
         page_url = (
             f"{hh_base().rstrip('/')}/search/vacancy?"
@@ -48,6 +56,11 @@ def fetch_hh_vacancies(acc: dict, text: str, area_id=113, per_page: int = 20,
         response.raise_for_status()
         parsed = parse_search_page(response.text)
         ids = parsed["ids"]
+        out.pagination['pages_loaded'] += 1
+        if not ids or set(ids) <= seen:
+            out.pagination['stop_reason'] = 'empty_page' if not ids else 'repeated_page'
+            break
+        seen.update(ids)
         log_debug(
             f"COLLECT_PAGE parsed [{label}] mode=web-fallback "
             f"page={current + 1} vacancies={len(ids)} url={page_url}"

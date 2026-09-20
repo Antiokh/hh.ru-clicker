@@ -19,6 +19,7 @@ import asyncio
 import concurrent.futures
 import sys
 import types
+from datetime import datetime, timezone
 
 import pytest
 
@@ -245,13 +246,15 @@ def test_questionnaire_no_proxy_direct(hh_no_proxy, monkeypatch):
 
 @pytest.mark.parametrize('status,body,location,expected', [
     (302, '', '/account/login', 'auth_error'),
-    (302, '', '/vacancy/777', 'error'),
-    (200, '<html>validation failed</html>', '', 'error'),
+    (302, '', '/vacancy/777', 'unknown'),
+    (200, '<html>validation failed</html>', '', 'unknown'),
     (200, '<html>"/account/login"</html>', '', 'auth_error'),
     (200, '{"success":true,"topic_id":"1"}', '', 'sent'),
     (302, '', '/?withoutTest=no', 'test'),
 ])
 def test_questionnaire_requires_confirmed_success(hh_no_proxy, monkeypatch, status, body, location, expected):
+    from app import apply_confirmation
+    monkeypatch.setattr(apply_confirmation, 'confirm_application_receipt', lambda *args: None)
     monkeypatch.setattr(hh_apply.CONFIG, 'llm_fill_questionnaire', False)
     response = _RecResp(status, body)
     response.headers = {'location': location}
@@ -261,3 +264,102 @@ def test_questionnaire_requires_confirmed_success(hh_no_proxy, monkeypatch, stat
     result, _ = _run_coro(hh_apply.fill_and_submit_questionnaire(_make_acc(), '777'))
     assert result == expected
     assert [call[0] for call in rec.calls] == ['GET', 'POST']
+
+
+@pytest.mark.parametrize('status,body,location', [
+    (302, '', '/vacancy/777'),
+    (303, '', '/vacancy/777'),
+    (200, '<html>ambiguous</html>', ''),
+    (503, '', ''),
+])
+def test_questionnaire_ambiguous_response_uses_one_fresh_receipt(
+        hh_no_proxy, monkeypatch, status, body, location):
+    from app import apply_confirmation
+    from unittest.mock import Mock
+    monkeypatch.setattr(hh_apply.CONFIG, 'llm_fill_questionnaire', False)
+    confirm = Mock(return_value={'negotiation_id': 'topic1', 'receipt_confirmed': True,
+                                'receipt_created_at': datetime.now(timezone.utc).isoformat()})
+    monkeypatch.setattr(apply_confirmation, 'confirm_application_receipt', confirm)
+    response = _RecResp(status, body)
+    response.headers = {'location': location}
+    rec = _install_recorder(monkeypatch,
+        get_resp=_RecResp(200, '<textarea name="task_1_text"></textarea>'), post_resp=response)
+    original = {**_make_acc(), '_pinned_resume_id': 'pinned'}
+    ephemeral = {**original, 'cookies': {'hhtoken': 'temporary'}}
+    result, info = _run_coro(hh_apply.fill_and_submit_questionnaire(
+        ephemeral, '777', receipt_account=original))
+    assert result == 'sent' and info['receipt_confirmed'] is True
+    confirm.assert_called_once_with(original, '777', 'pinned')
+    assert [call[0] for call in rec.calls] == ['GET', 'POST']
+    fields = {entry[0]['name']: entry[2] for entry in rec.calls[1][2]['data']._fields}
+    assert fields['resume_hash'] == 'pinned'
+
+
+@pytest.mark.parametrize('confirmed', [False, True])
+def test_questionnaire_post_timeout_reconciles_without_second_post(hh_no_proxy, monkeypatch, confirmed):
+    from app import apply_confirmation
+    from unittest.mock import Mock
+    monkeypatch.setattr(hh_apply.CONFIG, 'llm_fill_questionnaire', False)
+    receipt = {'negotiation_id': 'topic1', 'receipt_confirmed': True,
+               'receipt_created_at': datetime.now(timezone.utc).isoformat()} if confirmed else None
+    confirm = Mock(return_value=receipt)
+    monkeypatch.setattr(apply_confirmation, 'confirm_application_receipt', confirm)
+    rec = _install_recorder(monkeypatch,
+        get_resp=_RecResp(200, '<textarea name="task_1_text"></textarea>'))
+
+    def timeout(self, url, **kwargs):
+        self._recorder.calls.append(('POST', url, kwargs))
+        raise TimeoutError('synthetic')
+
+    monkeypatch.setattr(_RecordingSession, 'post', timeout)
+    result, _ = _run_coro(hh_apply.fill_and_submit_questionnaire(_make_acc(), '777'))
+    assert result == ('sent' if confirmed else 'unknown')
+    assert confirm.call_count == 1
+    assert [call[0] for call in rec.calls] == ['GET', 'POST']
+
+
+def test_questionnaire_cancel_before_post_does_not_confirm(hh_no_proxy, monkeypatch):
+    from app import apply_confirmation
+    from unittest.mock import Mock
+    monkeypatch.setattr(hh_apply.CONFIG, 'llm_fill_questionnaire', False)
+    confirm = Mock()
+    monkeypatch.setattr(apply_confirmation, 'confirm_application_receipt', confirm)
+    rec = _install_recorder(monkeypatch,
+        get_resp=_RecResp(200, '<textarea name="task_1_text"></textarea>'))
+    acc = {**_make_acc(), '_mutation_guard': lambda: False}
+    result, _ = _run_coro(hh_apply.fill_and_submit_questionnaire(acc, '777'))
+    assert result == 'cancelled'
+    confirm.assert_not_called()
+    assert [call[0] for call in rec.calls] == ['GET']
+
+
+@pytest.mark.parametrize('created', [None, '2020-01-01T00:00:00+00:00', '2099-01-01T00:00:00+00:00'])
+def test_old_or_undated_receipt_is_already_not_new_sent(hh_no_proxy, monkeypatch, created):
+    from app import apply_confirmation
+    from unittest.mock import Mock
+    monkeypatch.setattr(hh_apply.CONFIG, 'llm_fill_questionnaire', False)
+    receipt = {'negotiation_id': 'topic1', 'receipt_confirmed': True}
+    if created is not None:
+        receipt['receipt_created_at'] = created
+    monkeypatch.setattr(apply_confirmation, 'confirm_application_receipt', Mock(return_value=receipt))
+    response = _RecResp(302, '')
+    response.headers = {'location': '/vacancy/777'}
+    rec = _install_recorder(monkeypatch,
+        get_resp=_RecResp(200, '<textarea name="task_1_text"></textarea>'), post_resp=response)
+    result, _ = _run_coro(hh_apply.fill_and_submit_questionnaire(_make_acc(), '777'))
+    assert result == 'already'
+    assert [call[0] for call in rec.calls] == ['GET', 'POST']
+
+
+def test_questionnaire_form_get_exception_is_not_unknown_mutation(hh_no_proxy, monkeypatch):
+    from app import apply_confirmation
+    from unittest.mock import Mock
+    confirm = Mock()
+    monkeypatch.setattr(apply_confirmation, 'confirm_application_receipt', confirm)
+    _install_recorder(monkeypatch)
+    def fail_get(self, url, **kwargs):
+        raise TimeoutError('synthetic')
+    monkeypatch.setattr(_RecordingSession, 'get', fail_get)
+    result, info = _run_coro(hh_apply.fill_and_submit_questionnaire(_make_acc(), '777'))
+    assert result == 'error' and info['error_code'] == 'questionnaire_fetch_failed'
+    confirm.assert_not_called()

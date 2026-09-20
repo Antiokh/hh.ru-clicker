@@ -40,7 +40,7 @@ def send_message(acc: dict, chat_id: str, text: str,
         data = mobile_request(acc, "POST", f"/chats/{chat_id}/messages",
                               json_body=body)
     except MobileAPIError as e:
-        if is_fallback_status(e.status_code):
+        if e.outcome_unknown or is_fallback_status(e.status_code):
             # Не глотим: fallback-обёртка повторит отправку через web-flow.
             raise
         if e.status_code == 404:

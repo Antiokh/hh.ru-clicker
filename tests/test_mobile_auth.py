@@ -212,19 +212,31 @@ def test_proxy_fail_closed_when_hh_proxy_configured(isolated_mobile, monkeypatch
         ma.HHMobileClient()
     # Сбой внутренней инфраструктуры — не вина клиента: статус 5xx, не 4xx.
     assert excinfo.value.status_code >= 500
-    assert "HH_PROXY" in str(excinfo.value)
+    assert "настройки подключения" in str(excinfo.value)
 
 
-def test_no_proxy_mode_when_hh_proxy_not_configured(isolated_mobile, monkeypatch):
-    """HH_PROXY не задан — легитимный режим без прокси даже при сбое механизма."""
+def test_broken_proxy_config_is_not_direct_even_without_env(isolated_mobile, monkeypatch):
+    """An absent environment variable cannot turn a config-read error into direct."""
     monkeypatch.delenv("HH_PROXY", raising=False)
 
     def broken_egress():
         raise RuntimeError("egress-механизм недоступен")
 
     monkeypatch.setattr("app.hh_http.egress_proxy", broken_egress)
-    client = ma.HHMobileClient()
-    assert not client.session.proxies
+    with pytest.raises(ma.MobileAuthError):
+        ma.HHMobileClient()
+
+
+def test_explicit_empty_proxy_clears_stale_mobile_session_proxy(isolated_mobile, monkeypatch):
+    choice = {"proxy": "http://synthetic-proxy.test:3128"}
+    monkeypatch.setattr("app.hh_http.egress_proxy", lambda: choice["proxy"])
+    session = FakeSession([FakeResponse(payload={"id": "synthetic"})])
+    client = ma.HHMobileClient(session=session)
+    assert session.proxies["https"] == choice["proxy"]
+    choice["proxy"] = ""
+    client._request("GET", "me", token="synthetic")
+    assert session.proxies == {} and session.trust_env is False
+    assert session.calls[0][2]["proxies"] == {}
 
 
 def test_proxy_applied_to_session(isolated_mobile, monkeypatch):

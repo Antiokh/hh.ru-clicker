@@ -2,8 +2,10 @@
 Manual vacancy apply flow (two-step: check + submit).
 """
 
+import asyncio
 import json
 import re
+from datetime import datetime, timezone
 
 import aiohttp
 from fastapi import APIRouter
@@ -18,7 +20,8 @@ from app.hh_client_fallback import FallbackHHClient
 from app.questionnaire import get_questionnaire_answer, _parse_questionnaire_rich
 from app.instances import bot
 from app.user_agent import webview_user_agent
-from app.hh_apply import _aio_egress_kwargs
+from app.hh_apply import _aio_egress_kwargs, classify_apply_response
+from app.mutation_safety import ensure_mutation_allowed, MutationBlocked
 from app.mobile_questionnaire import oauth_web_account
 
 
@@ -97,6 +100,10 @@ def _result_to_response(result: str, info: dict, vid: str,
     """
     if result == "sent":
         return {"status": "sent", "vacancy_id": vid, "message": "Отклик успешно отправлен ✅"}
+    if result == "unknown":
+        return {"status": "unknown", "vacancy_id": vid, "message": "Результат не подтверждён. Проверьте отклик в HH перед повторной отправкой."}
+    if result == "cancelled":
+        return {"status": "cancelled", "vacancy_id": vid, "message": "Отправка отменена: аккаунт остановлен или на паузе."}
     if result == "limit":
         return {"status": "limit", "vacancy_id": vid, "message": "Достигнут дневной лимит откликов"}
     if result == "already":
@@ -129,7 +136,16 @@ async def _mobile_submit_response(acc_idx: int, acc: dict, vid: str, client) -> 
     (анкеты не было). result="test" → добираем вопросы существующим
     _fetch_questionnaire_data, чтобы UI перезапустил check/submit с ответами.
     """
-    result, info = await client.submit_response(vid)
+    try:
+        result, info = await client.submit_response(vid)
+    except MutationBlocked:
+        return _result_to_response("cancelled", {}, vid)
+    except Exception as exc:
+        if getattr(exc, "outcome_unknown", False):
+            return _hold_unknown(acc_idx, vid)
+        raise
+    if result == "unknown":
+        return _hold_unknown(acc_idx, vid)
 
     if result == "sent":
         state = bot._get_apply_state(acc_idx)
@@ -147,6 +163,223 @@ async def _mobile_submit_response(acc_idx: int, acc: dict, vid: str, client) -> 
         questions = qdata["questions"]
 
     return _result_to_response(result, info, vid, questions=questions, letter=acc["letter"])
+
+
+def _hold_unknown(acc_idx: int, vid: str) -> dict:
+    state = bot._get_apply_state(acc_idx)
+    if state is not None:
+        acc = state.acc
+        bot.hold_pending_apply(
+            state, vid, str(acc.get("_pinned_resume_id") or acc.get("resume_hash") or ""),
+            reason_code="unconfirmed_response",
+        )
+    return _result_to_response("unknown", {}, vid)
+
+
+@router.post("/api/account/{idx}/reconcile-application")
+async def api_reconcile_application(idx: int):
+    """Verify a held application with fresh GETs; never submit it again.
+
+    POST is required because a confirmed receipt updates local bookkeeping and
+    may release this account's protective pause. The existing API-key middleware
+    protects the action, just like the pause/start controls.
+    """
+    from app.apply_confirmation import confirm_application_receipt, receipt_check_failure_reason
+
+    state = bot._get_apply_state(idx)
+    if state is None:
+        return {"ok": False, "message": "Аккаунт не найден"}
+    with state._state_lock:
+        pending = dict(getattr(state, "pending_apply", None) or {})
+        acc = {**state.acc, "cookies": dict(state.acc.get("cookies") or {})}
+        expected_account = {"resume_hash": acc.get("resume_hash"),
+                            "user_id": acc.get("user_id"), "cookies": acc["cookies"].copy()}
+    vid = str(pending.get("vacancy_id") or "")
+    resume_id = str(pending.get("resume_id") or "")
+    if not vid or not resume_id:
+        return {"ok": False, "message": "Нет сохранённого отклика для сверки"}
+    # This ID comes from our persisted attempt, never from a caller's request.
+    # An automatically selected resume can differ from the active search resume.
+    acc["_pinned_resume_id"] = resume_id
+    with state._state_lock:
+        if getattr(state, "receipt_check_started_at", None):
+            return {"ok": False, "busy": True,
+                    "message": "Сверка с HH уже идёт. Дождитесь её результата."}
+        if dict(getattr(state, "pending_apply", None) or {}) != pending:
+            return {"ok": False, "message": "Отклик для сверки изменился. Обновите карточку."}
+        check_started_at = datetime.now(timezone.utc).isoformat()
+        state.receipt_check_started_at = check_started_at
+
+    # A disconnected HTTP client does not cancel requests.get in its thread.
+    # Keep the activity and busy guard until that actual read finishes, but do
+    # not apply its result after the caller has cancelled this action.
+    def read_receipt():
+        # Read the diagnostic in the same thread as the helper's GET.
+        receipt = confirm_application_receipt(acc, vid, resume_id)
+        reason = receipt_check_failure_reason()
+        if not isinstance(reason, str) or reason not in (
+                "connect_timeout", "read_timeout", "auth", "rate_limit", "unconfirmed"):
+            reason = "unconfirmed"
+        return receipt, reason
+
+    check_task = asyncio.create_task(asyncio.to_thread(read_receipt))
+    state._receipt_check_task = check_task
+    caller_active = True
+
+    def clear_check():
+        with state._state_lock:
+            if getattr(state, "_receipt_check_task", None) is check_task:
+                state.receipt_check_started_at = None
+                state._receipt_check_task = None
+
+    def finished(done):
+        if not done.cancelled():
+            done.exception()  # Retrieve errors even when the HTTP caller left.
+        if not caller_active:
+            clear_check()
+
+    check_task.add_done_callback(finished)
+    try:
+        try:
+            receipt, failure_reason = await asyncio.shield(check_task)
+        except Exception:
+            # Do not expose raw HTTP exceptions (proxy credentials, session data).
+            receipt = None
+            failure_reason = "unconfirmed"
+        if not receipt or receipt.get("receipt_confirmed") is not True:
+            bot.record_receipt_failure(idx, failure_reason, expected_state=state,
+                expected_pending=pending, expected_account=expected_account)
+            explanation = {
+                "connect_timeout": "Нет соединения с HH через настроенный прокси.",
+                "read_timeout": "HH не ответил на проверку вовремя.",
+                "auth": "Для сверки требуется восстановить авторизацию HH.",
+                "rate_limit": "HH временно ограничил проверки. Не повторяйте запрос сейчас.",
+            }.get(failure_reason, "HH пока не подтвердил отклик.")
+            return {
+                "ok": False, "confirmed": False, "paused": bool(state.paused),
+                "message": explanation + " Пауза сохранена; повторной отправки не было.",
+            }
+        resolved = bot.confirm_pending_apply(
+            idx, vid, resume_id, str(receipt.get("negotiation_id") or ""),
+            receipt_created_at=str(receipt.get("receipt_created_at") or ""),
+            expected_state=state, expected_pending=pending, expected_account=expected_account,
+        )
+        if not resolved:
+            return {"ok": False, "confirmed": True,
+                    "message": "Состояние аккаунта изменилось во время сверки. Обновите карточку."}
+        with state._state_lock:
+            paused = bool(state.paused)
+            remaining = bool(getattr(state, "pending_apply", None))
+        return {
+            "ok": True, "confirmed": True, "paused": paused, "pending": remaining,
+            "message": ("Отклик подтверждён. Есть ещё отклик для сверки." if remaining else
+                        "Отклик подтверждён. Защитная пауза снята; общая пауза и лимиты сохранены."),
+        }
+    finally:
+        caller_active = False
+        # Hold the shared guard through local commit, not merely through GET.
+        # Cancellation leaves it held until the actual blocking read finishes.
+        if check_task.done():
+            clear_check()
+
+
+@router.post("/api/account/{idx}/recheck-auth")
+async def api_recheck_auth(idx: int):
+    """Fresh OAuth + WebView GET proof, followed by a guarded local resume.
+
+    No password/OTP login, token refresh or vacancy submission is performed.
+    The temporary WebView cookies are discarded. This local POST is API-key
+    protected because success releases an existing pause.
+    """
+    from app.auth_verification import verify_oauth_and_web_access, _failure
+
+    def rejected(reason):
+        return {"ok": False, "paused": True, **_failure(reason)}
+
+    state = bot._get_apply_state(idx)
+    if state is None:
+        return {"ok": False, "verified": False, "reason": "not_applicable",
+                "message": "Аккаунт не найден. Обновите список."}
+    with state._state_lock:
+        if (getattr(state, "auth_check_started_at", None)
+                or getattr(state, "receipt_check_started_at", None)
+                or getattr(state, "_auth_recovery_pending", False)):
+            return {"ok": False, "busy": True,
+                    "message": "Проверка HH уже идёт. Дождитесь её результата."}
+        recovery_reason = state.paused_reason
+        raw_network_recovery = getattr(state, "network_recovery", None)
+        network_recovery = dict(raw_network_recovery) if isinstance(raw_network_recovery, dict) else {}
+        if (not state.paused or recovery_reason not in ("auth", "network_error")
+                or (recovery_reason == "network_error" and not network_recovery)
+                or str(state.acc.get("mode") or "").lower() != "oauth"
+                or getattr(state, "pending_apply", None)
+                or getattr(state, "pending_applies", None)
+                or state._deleted or state.hard_stopped or state.limit_exceeded
+                or bot.paused or bot._stop_event.is_set()):
+            return {"ok": False, "verified": False, "reason": "not_applicable",
+                    "paused": bool(state.paused),
+                    "message": "Проверка доступна для OAuth-паузы входа или подтверждённого сетевого сбоя без других ограничений. Обновите карточку."}
+        acc = {**state.acc, "cookies": dict(state.acc.get("cookies") or {})}
+        expected_account = {"resume_hash": acc.get("resume_hash"),
+                            "user_id": acc.get("user_id"), "cookies": acc["cookies"].copy()}
+        expected_control = bot._limit_check_guard(state)
+        state.auth_check_started_at = datetime.now(timezone.utc).isoformat()
+
+    # A disconnected caller cannot cancel the underlying requests thread. Keep
+    # the busy marker until it really finishes, and discard an abandoned proof.
+    task = asyncio.create_task(asyncio.to_thread(verify_oauth_and_web_access, acc))
+    state._auth_check_task = task
+    caller_active = True
+
+    def clear_check():
+        with state._state_lock:
+            if getattr(state, "_auth_check_task", None) is task:
+                state.auth_check_started_at = None
+                state._auth_check_task = None
+
+    def finished(done):
+        if not done.cancelled():
+            done.exception()
+        if not caller_active:
+            clear_check()
+
+    task.add_done_callback(finished)
+    try:
+        try:
+            proof = await asyncio.shield(task)
+        except Exception:
+            proof = {"verified": False, "reason": "unavailable"}
+        if not isinstance(proof, dict) or proof.get("verified") is not True:
+            reason = proof.get("reason") if isinstance(proof, dict) else "unavailable"
+            reason = _failure(reason)["reason"]
+            if recovery_reason == "network_error":
+                try:
+                    bot.record_network_probe_failure(idx, reason, expected_state=state,
+                        expected_account=expected_account, expected_control=expected_control,
+                        expected_network_recovery=network_recovery)
+                except Exception:
+                    pass  # A failed local record is never permission to resume.
+            return rejected(reason)
+        try:
+            network_kwargs = ({"recovery_reason": "network_error",
+                               "expected_network_recovery": network_recovery}
+                              if recovery_reason == "network_error" else {})
+            recovered = bot.recover_verified_auth(idx, expected_state=state,
+                expected_account=expected_account, expected_control=expected_control,
+                **network_kwargs)
+        except Exception:
+            return rejected("unavailable")
+        if not recovered:
+            return rejected("stale")
+        return {"ok": True, "verified": True, "paused": False,
+                "message": ("Связь с HH, OAuth и доступ к веб-анкетам подтверждены. Сетевая пауза снята."
+                            if recovery_reason == "network_error" else
+                            "OAuth и вход в веб-анкеты подтверждены. Пауза авторизации снята.")}
+    finally:
+        caller_active = False
+        # Guard covers the local durable commit too, not only network reads.
+        if task.done():
+            clear_check()
 
 
 @router.post("/api/apply/check")
@@ -178,6 +411,7 @@ async def api_apply_check(body: dict):
         return {"status": "error", "vacancy_id": vid, "message": f"OAuth autologin: {exc}"}
 
     sess_kw, req_kw = _aio_egress_kwargs()
+    dispatched = False
     try:
         async with aiohttp.ClientSession(
             cookies=acc["cookies"],
@@ -188,6 +422,8 @@ async def api_apply_check(body: dict):
             for k, v in [("resume_hash", acc["resume_hash"]), ("vacancy_id", vid),
                          ("letter", acc["letter"]), ("lux", "true"), ("ignore_postponed", "true")]:
                 data.add_field(k, v)
+            ensure_mutation_allowed(acc)
+            dispatched = True
             async with session.post(
                 hh_base() + "/applicant/vacancy_response/popup",
                 data=data, timeout=aiohttp.ClientTimeout(total=10), **req_kw
@@ -199,6 +435,11 @@ async def api_apply_check(body: dict):
             return {"status": "error", "vacancy_id": vid, "message": "⚠️ Куки протухли — обновите в настройках"}
 
         if status_code == 200:
+            confirmed_result, confirmed_info = classify_apply_response(status_code, txt)
+            if confirmed_result == "unknown":
+                return _hold_unknown(acc_idx, vid)
+            if confirmed_result != "sent":
+                return _result_to_response(confirmed_result, confirmed_info, vid)
             info = {}
             if "shortVacancy" in txt:
                 try:
@@ -228,10 +469,14 @@ async def api_apply_check(body: dict):
                 "message": f"Вакансия требует опрос ({len(qdata['questions'])} вопросов)",
             }
 
+        if status_code >= 500:
+            return _hold_unknown(acc_idx, vid)
         return {"status": "error", "vacancy_id": vid, "message": f"HTTP {status_code}: {txt[:100]}"}
 
+    except MutationBlocked:
+        return _result_to_response("cancelled", {}, vid)
     except Exception as e:
-        return {"status": "error", "message": str(e)}
+        return _hold_unknown(acc_idx, vid) if dispatched else {"status": "error", "message": str(e)}
 
 
 @router.post("/api/apply/submit")
@@ -277,6 +522,7 @@ async def api_apply_submit(body: dict):
     url_form = f"{hh_base()}/applicant/vacancy_response?vacancyId={vid}&withoutTest=no"
 
     sess_kw, req_kw = _aio_egress_kwargs()
+    dispatched = False
     try:
         async with aiohttp.ClientSession(
             cookies=acc["cookies"],
@@ -309,6 +555,8 @@ async def api_apply_submit(body: dict):
                 else:
                     form.add_field(name, str(value))
 
+            ensure_mutation_allowed(acc)
+            dispatched = True
             async with session.post(
                 url_form,
                 headers={"X-Xsrftoken": acc.get("cookies", {}).get("_xsrf", ""), "Referer": url_form},
@@ -319,12 +567,19 @@ async def api_apply_submit(body: dict):
             ) as r2:
                 status = r2.status
                 location = r2.headers.get("location", "")
+                response_text = await r2.text()
 
         if status in (302, 303):
             if "negotiations-limit-exceeded" in location:
                 return {"status": "limit", "message": "Достигнут лимит откликов"}
             if "withoutTest=no" in location or f"vacancyId={vid}" in location:
                 return {"status": "error", "message": "Форма не принята — возможно не все вопросы заполнены"}
+            return _hold_unknown(acc_idx, vid)
+
+        result, info = classify_apply_response(status, response_text)
+        if result == "unknown":
+            return _hold_unknown(acc_idx, vid)
+        if result == "sent":
             state = bot._get_apply_state(acc_idx)
             if state:
                 state.sent += 1
@@ -335,7 +590,9 @@ async def api_apply_submit(body: dict):
             bot._add_log(short, color, f"\U0001f4dd Ручной отклик (опрос): {vid}", "success")
             return {"status": "sent", "message": "Отклик успешно отправлен ✅"}
 
-        return {"status": "error", "message": f"HTTP {status}"}
+        return _result_to_response(result, info, vid)
 
+    except MutationBlocked:
+        return _result_to_response("cancelled", {}, vid)
     except Exception as e:
-        return {"status": "error", "message": str(e)}
+        return _hold_unknown(acc_idx, vid) if dispatched else {"status": "error", "message": str(e)}

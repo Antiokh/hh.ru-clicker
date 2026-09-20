@@ -26,6 +26,7 @@ from app import oauth
 from app.hh_http import egress_proxies
 from app.logging_utils import log_debug
 from app.user_agent import ensure_device_identity, mobile_user_agent
+from app.mutation_safety import ensure_mutation_allowed
 
 MOBILE_BASE = "https://api.hh.ru"
 MOBILE_UA = "ru.hh.android/26.32.11480"
@@ -39,10 +40,11 @@ class MobileAPIError(Exception):
     (или обрезанный текст ответа), для сетевых — текст исключения.
     """
 
-    def __init__(self, status_code: int, payload=None, url: str = ""):
+    def __init__(self, status_code: int, payload=None, url: str = "", *, outcome_unknown=False):
         self.status_code = status_code
         self.payload = payload
         self.url = url
+        self.outcome_unknown = outcome_unknown
         super().__init__(f"mobile API {url} -> HTTP {status_code}")
 
 
@@ -87,15 +89,19 @@ def mobile_request(acc: dict, method: str, path: str, *, params=None,
     token = oauth._obtain_oauth_token(acc)
     if not token:
         raise MobileAPIError(401, payload="no_oauth_token", url=url)
+    mutating = method.upper() not in ("GET", "HEAD", "OPTIONS")
+    if mutating:
+        ensure_mutation_allowed(acc)
+    from app.hh_http import PinnedEgressSession
     try:
-        r = requests.request(
-            method, url, params=params, json=json_body, data=form,
-            headers=mobile_headers(acc, token), proxies=egress_proxies(),
-            timeout=timeout,
-        )
+        with PinnedEgressSession() as session:
+            r = session.request(
+                method, url, params=params, json=json_body, data=form,
+                headers=mobile_headers(acc, token), timeout=timeout,
+            )
     except requests.RequestException as e:
         log_debug(f"mobile_request {method} {url}: network error {e}")
-        raise MobileAPIError(0, payload=str(e), url=url)
+        raise MobileAPIError(0, payload=str(e), url=url, outcome_unknown=mutating)
     if r.status_code == 401:
         # HH может отозвать access token раньше локального expires_at. Не
         # повторяем здесь POST/PUT: следующий вызов получит свежий token, а
@@ -106,10 +112,15 @@ def mobile_request(acc: dict, method: str, path: str, *, params=None,
             payload = r.json()
         except ValueError:
             payload = r.text[:500]
-        raise MobileAPIError(r.status_code, payload=payload, url=url)
+        raise MobileAPIError(r.status_code, payload=payload, url=url,
+                             outcome_unknown=mutating and r.status_code >= 500)
     if not r.content:
+        if mutating and url.rstrip("/").endswith("/negotiations") and r.status_code not in (201, 204):
+            raise MobileAPIError(r.status_code, payload="empty_mutation_response", url=url,
+                                 outcome_unknown=True)
         return None
     try:
         return r.json()
     except ValueError:
-        return None
+        raise MobileAPIError(r.status_code, payload="invalid_json", url=url,
+                             outcome_unknown=mutating)

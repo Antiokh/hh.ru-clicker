@@ -28,7 +28,7 @@ Responsive
 
 WS reconnect
 - onclose: #conn-dot теряет класс connected, все кнопки (.btn-sm, .apply-btn,
-  button[onclick]) кроме #pause-btn становятся disabled; reconnect через
+  button[onclick]), включая #pause-btn, становятся disabled; reconnect через
   setTimeout от 1s (x2 до 30s), onopen возвращает connected и re-enable.
   close code 4401 останавливает цикл (не тестируем: требует отдельного
   серверного сценария авторизации).
@@ -273,7 +273,7 @@ def test_responsive_narrow_header_and_tabs_reachable(ui, width, height):
 
 
 def test_ws_reconnect_after_server_close(ui):
-    """Серверный разрыв: conn-dot гаснет, кнопки (кроме #pause-btn) disabled,
+    """Серверный разрыв: conn-dot гаснет, все command-кнопки disabled,
     затем клиент сам переподключается (reconnect delay от 1s)."""
     _prime_state(ui)
     ui.open()
@@ -286,10 +286,10 @@ def test_ws_reconnect_after_server_close(ui):
 
     ui.close_ws(code=1000)
 
-    # onclose: индикатор гаснет, кнопки (кроме pause) блокируются
+    # onclose: индикатор гаснет, в том числе pause блокируется (нет silent drop)
     expect(dot).not_to_have_class(CONNECTED, timeout=5_000)
     expect(lang_btn).to_be_disabled(timeout=5_000)
-    expect(pause_btn).to_be_enabled()
+    expect(pause_btn).to_be_disabled()
 
     # reconnect: delay начинается с 1s → с запасом ждём до 10s
     expect(dot).to_have_class(CONNECTED, timeout=10_000)

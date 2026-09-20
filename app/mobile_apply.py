@@ -93,6 +93,8 @@ def pick_suitable_resume(acc: dict, vacancy_id: str,
     резюме. Для одного резюме или выключенного флага сетевой вызов не нужен.
     """
     default_resume_id = str(default_resume_id or acc.get("resume_hash") or "")
+    if acc.get("_pinned_resume_id"):
+        return str(acc["_pinned_resume_id"])
     all_resumes = acc.get("all_resumes") or []
     if not CONFIG.auto_pick_resume or len(all_resumes) <= 1:
         return default_resume_id
@@ -158,6 +160,10 @@ def submit_response(acc: dict, vacancy_id: str, resume_id: str,
     - fallback-статусы (0 сеть / 401 / 403 / 5xx): MobileAPIError
       перекидывается наверх без обработки — для повтора через web-flow.
     """
+    from app.apply_quarantine import blocked
+    if blocked(acc, vacancy_id):
+        return {"ok": False, "error_type": "outcome_unknown",
+                "error": "Previous application outcome is unknown; retry blocked"}
     resume_id = pick_suitable_resume(acc, vacancy_id, resume_id)
     if resume_id is None:
         return {
@@ -188,6 +194,8 @@ def submit_response(acc: dict, vacancy_id: str, resume_id: str,
             form=form,
         )
     except MobileAPIError as e:
+        if e.outcome_unknown:
+            raise
         code = _extract_error_code(e.payload)
         # HH отдаёт бизнес-отказы и с HTTP 403. Их нельзя принимать за
         # auth/scope и повторять изменяющий состояние отклик через web.
@@ -202,6 +210,8 @@ def submit_response(acc: dict, vacancy_id: str, resume_id: str,
             "error": _ERROR_DESCRIPTIONS.get(code, f"HTTP {e.status_code}"),
             "http_status": e.status_code,
         }
+    if data is not None and (not isinstance(data, dict) or "id" not in data):
+        raise MobileAPIError(200, payload="unrecognized_apply_result", outcome_unknown=True)
     neg_id = data.get("id") if isinstance(data, dict) else None
     log_debug(f"mobile submit_response vacancy={vacancy_id}: "
               f"ok, negotiation_id={neg_id}")

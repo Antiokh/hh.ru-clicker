@@ -83,7 +83,7 @@ def test_network_error_raises_status_zero(monkeypatch):
     def _raise(*a, **kw):
         raise _requests.exceptions.ConnectionError("boom")
 
-    monkeypatch.setattr(_requests, "request", _raise)
+    monkeypatch.setattr(_requests.Session, "request", _raise)
     with pytest.raises(MobileAPIError) as ei:
         mobile_request(ACC, "GET", "/chats")
     assert ei.value.status_code == 0

@@ -51,6 +51,7 @@ FallbackHHClient поверх MobileHHClient с auto-fallback на web-flow;
 """
 
 from abc import ABC, abstractmethod
+from app.mutation_safety import MUTATING_METHODS, guarded_method
 
 
 class HHClientBase(ABC):
@@ -65,9 +66,17 @@ class HHClientBase(ABC):
     def __init__(self, acc: dict):
         self.acc = acc
 
+    def __getattribute__(self, name):
+        value = super().__getattribute__(name)
+        if name in MUTATING_METHODS:
+            acc = super().__getattribute__("__dict__").get("acc")
+            if acc is not None:
+                return guarded_method(value, acc)
+        return value
+
     @abstractmethod
     def search_vacancies(self, text: str, area_id=113, per_page: int = 20,
-                         page: int = 0, filters=None, max_pages: int = 20) -> list:
+                         page: int = 0, filters=None, max_pages: int = 100) -> list:
         """Поиск вакансий; mobile: GET api.hh.ru/vacancies."""
         ...
 
@@ -167,7 +176,7 @@ class HHClientBase(ABC):
         ...
 
     @abstractmethod
-    def check_limit(self) -> bool:
+    def check_limit(self) -> bool | None:
         """Проверка лимита откликов; web: hh_apply.check_limit."""
         ...
 

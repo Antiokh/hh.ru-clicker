@@ -96,6 +96,7 @@ def _mock_web_negotiations(monkeypatch, payload):
     )
 
 
+@responses.activate
 def test_neg_ids_account_without_mode_auto_uses_web_client(
     monkeypatch, tmp_data_dir, fake_state, live_oauth
 ):
@@ -107,6 +108,9 @@ def test_neg_ids_account_without_mode_auto_uses_web_client(
     acc = {"name": "a1", "cookies": {}, "resume_hash": "rh1"}  # без "mode"
     fake_state(acc)
     _mock_web_negotiations(monkeypatch, {"items": [1, 2, 3]})
+    # Auto is mobile-first too: make the expected fallback deterministic/offline.
+    responses.add(responses.GET, MOBILE_BASE + "/negotiations",
+                  json={"errors": [{"value": "unauthorized"}]}, status=401)
 
     result = _run(api_debug_neg_ids(0))
 

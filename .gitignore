@@ -1,6 +1,8 @@
 # Данные пользователя
 data/
 backups/
+# Local dashboard screenshots can contain account names and messages.
+images/[0-9][0-9]-*.png
 .env
 .env.local
 .env.*

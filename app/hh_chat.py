@@ -7,6 +7,7 @@ import urllib.parse
 import requests
 from app.config import hh_base
 from app.hh_http import HH, egress_proxy
+from app.mutation_safety import ensure_mutation_allowed, MutationBlocked, OutcomeUnknown
 from app.user_agent import webview_user_agent
 from app.oauth import _token_key
 
@@ -374,6 +375,7 @@ def send_participant_action(acc: dict, chat_id: str, action_type: str = "TYPING"
     xsrf = (acc.get("cookies") or {}).get("_xsrf", "")
     ua = webview_user_agent()
     try:
+        ensure_mutation_allowed(acc)
         r = HH.post(
             f"{_CHATIK_BASE}/chatik/api/participant_action",
             cookies=acc.get("cookies", {}),
@@ -414,6 +416,7 @@ def mark_chat_read(acc: dict, chat_id: str, message_id: str) -> bool:
     xsrf = (acc.get("cookies") or {}).get("_xsrf", "")
     ua = webview_user_agent()
     try:
+        ensure_mutation_allowed(acc)
         r = HH.post(
             f"{_CHATIK_BASE}/chatik/api/mark_read",
             cookies=acc.get("cookies", {}),
@@ -478,8 +481,12 @@ def send_negotiation_message(acc: dict, neg_id: str, text: str, topic_id: str = 
                     log_debug(f"OAuth chat send neg={neg_id}: нет токена, fallback на chatik")
                 else:
                     log_debug(f"OAuth chat send neg={neg_id}: result={_r!r}, fallback на chatik")
+            except (MutationBlocked, OutcomeUnknown):
+                raise
             except Exception as _e:
                 log_debug(f"OAuth chat send neg={neg_id} exception: {_e}, fallback на chatik")
+    except (MutationBlocked, OutcomeUnknown):
+        raise
     except Exception:
         pass
 
@@ -488,6 +495,7 @@ def send_negotiation_message(acc: dict, neg_id: str, text: str, topic_id: str = 
     xsrf = acc["cookies"].get("_xsrf", "")
 
     try:
+        ensure_mutation_allowed(acc)
         resp = HH.post(
             f"{_CHATIK_BASE}/chatik/api/send",
             cookies=acc["cookies"],
@@ -504,6 +512,8 @@ def send_negotiation_message(acc: dict, neg_id: str, text: str, topic_id: str = 
             timeout=15,
         )
         log_debug(f"send via chatik/api/send {neg_id}: HTTP {resp.status_code} | {resp.text[:300]}")
+        if resp.status_code >= 500:
+            raise OutcomeUnknown("Неизвестен результат отправки сообщения")
         if resp.status_code in (200, 201, 204):
             return True
         if resp.status_code == 409:
@@ -538,6 +548,10 @@ def send_negotiation_message(acc: dict, neg_id: str, text: str, topic_id: str = 
                 return False
             return False
         return False
+    except (MutationBlocked, OutcomeUnknown):
+        raise
+    except requests.RequestException as e:
+        raise OutcomeUnknown("Неизвестен результат отправки сообщения") from e
     except Exception as e:
         log_debug(f"send_negotiation_message {neg_id} error: {e}")
         return False
@@ -731,6 +745,7 @@ def _mark_chat_read(acc: dict, chat_id: str, message_id: str):
     _ensure_chatik_cookies(acc)
     xsrf = acc.get("cookies", {}).get("_xsrf", "")
     try:
+        ensure_mutation_allowed(acc)
         HH.post(
             f"{_CHATIK_BASE}/chatik/api/mark_read",
             headers={"User-Agent": webview_user_agent(),

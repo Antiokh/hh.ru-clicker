@@ -79,7 +79,7 @@ class MobileHHClient(HHClient):
         self.mode = str(acc.get("mode") or "mobile").strip().lower()
 
     def search_vacancies(self, text: str, area_id=113, per_page: int = 20,
-                         page: int = 0, filters=None, max_pages: int = 20) -> list:
+                         page: int = 0, filters=None, max_pages: int = 100) -> list:
         return mobile_search.search_vacancies(
             self.acc, text, area_id, per_page, page, filters, max_pages)
     def start_hedi(self) -> str:
@@ -264,9 +264,10 @@ class MobileHHClient(HHClient):
         """Setka employee-referral relevance (not a resume match score)."""
         return mobile_relevance.fetch_setka_relevance(self.acc, vid)
 
-    def check_limit(self) -> bool:
+    def check_limit(self) -> bool | None:
         """Проверка дневного лимита откликов (phase 3)."""
-        return not mobile_check_limit.check_limit(self.acc).get("can_apply", True)
+        allowed = mobile_check_limit.check_limit(self.acc).get("can_apply")
+        return None if allowed is None else not allowed
 
     def touch_resume(self) -> tuple:
         """Поднять резюме (touch) (phase 3)."""

@@ -12,8 +12,6 @@ services:
     # Не запускаем приложение от root: новые data/*.json должны принадлежать
     # host-пользователю, иначе host backup/restore перестаёт работать.
     user: "${HH_BOT_UID:-1000}:${HH_BOT_GID:-1000}"
-    depends_on:
-      - singbox
     ports:
       # LAN-доступ: bind на 0.0.0.0 — публикуем в сеть, защищено HH_BOT_API_KEY
       # + HH_BOT_UNSAFE_EXPOSE=1 (см. env ниже).
@@ -36,9 +34,10 @@ services:
       # доступа также нужны: ports без 127.0.0.1 префикса и HH_BOT_UNSAFE_EXPOSE=1
       # (0.0.0.0 уже задан выше; при заданном ключе opt-in не обязателен).
       # HH_BOT_API_KEY: "change-me"
-      # Весь исходящий hh.ru-трафик (aiohttp-отклики и chatik-WS) уважает HH_PROXY
-      # и идёт через sing-box-sidecar (VLESS+Reality → MSK IP).
-      HH_PROXY: "socks5h://singbox:1080"
+      # Прямое соединение по явному выбору владельца. Прокси не является
+      # обязательной зависимостью и не включается при перезапуске контейнера.
+      # Для явного возврата прокси можно задать URL здесь или через настройки.
+      HH_PROXY: ""
       # Phase 1 WS realtime (websocket.hh.ru): ходим НАПРЯМУЮ, не через singbox-цепочку.
       # "0" = direct (дефолт); "1" = WS тоже через HH_PROXY. singbox-сервис не трогаем.
       HH_WS_USE_PROXY: "0"

@@ -177,7 +177,9 @@ def test_apply_tests_fail_reverts_checkbox(ui):
 
     cb = ui.page.locator("#acc-apply-cb-0")
     expect(cb).to_be_visible()
-    cb.check()
+    # check() requires the checked state after the click; the mocked 500 can
+    # already have reverted it. Exercise the click and assert the rollback.
+    cb.click()
 
     # applyTestsToggle: !data.ok (или fetch-exception) → cb.checked = !cb.checked
     expect(cb).not_to_be_checked()

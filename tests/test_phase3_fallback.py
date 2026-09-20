@@ -184,7 +184,7 @@ def test_check_vacancy_before_apply_fallback_status_retries_web(
 
 @pytest.mark.parametrize("status", [401, 500])
 @responses.activate
-def test_check_limit_fallback_status_retries_web(monkeypatch, client, status):
+def test_check_limit_does_not_use_streak_or_infer_recovery(monkeypatch, client, status):
     responses.add(responses.GET, URL_STATISTIC,
                   json={"code": "unavailable"}, status=status)
 
@@ -195,10 +195,9 @@ def test_check_limit_fallback_status_retries_web(monkeypatch, client, status):
 
     result = client.check_limit()
 
-    assert result is True  # возвращён результат web-flow
-    assert len(web_calls) == 1
-    assert web_calls[0][0] == (ACC,)
-    _assert_single_mobile_call(URL_STATISTIC, status)
+    assert result is None
+    assert not web_calls
+    assert not responses.calls
 
 
 # ── touch_resume: 401 → web; 400 → NotImplementedError → web ─────────────────

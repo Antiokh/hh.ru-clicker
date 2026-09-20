@@ -190,7 +190,7 @@ def test_mobile_check_vacancy_before_apply_200(oauth_token, web_recs):
 
     result = MobileHHClient(ACC).check_vacancy_before_apply("v1")
 
-    assert result == {"ok": True, "hard_missing": [], "soft_missing": []}
+    assert result == {"ok": True, "resume_id": "rh1", "hard_missing": [], "soft_missing": []}
     assert web_recs["_check_vacancy_before_apply"] == []
 
 
@@ -203,7 +203,7 @@ def test_mobile_check_limit_200(oauth_token, web_recs):
 
     result = MobileHHClient(ACC).check_limit()
 
-    assert result is False  # can_apply=True → лимит НЕ активен
+    assert result is None  # A streak is not a daily quota.
     assert web_recs["check_limit"] == []
 
 

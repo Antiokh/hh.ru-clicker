@@ -5,6 +5,7 @@ In-memory cache with async disk persistence.
 
 import json
 import copy
+import errno
 import os
 import tempfile
 import threading
@@ -32,16 +33,20 @@ def _atomic_write_json(path: Path, data) -> None:
             f.flush()
             try:
                 os.fsync(f.fileno())
-            except OSError:
-                pass  # некоторые FS (tmpfs, WSL) не поддерживают fsync
+            except OSError as exc:
+                # Unsupported fsync is different from a real disk/write error.
+                # Transactional callers must not accept an EIO/ENOSPC as saved.
+                if exc.errno not in (errno.EINVAL, errno.ENOTSUP, errno.ENOSYS):
+                    raise
         os.replace(tmp, path)
         # fsync родительского каталога — иначе rename может быть потерян
         # даже если файл сфсинкан.
         try:
             dir_fd = os.open(str(path.parent), os.O_DIRECTORY)
             os.fsync(dir_fd)
-        except OSError:
-            pass
+        except OSError as exc:
+            if exc.errno not in (errno.EINVAL, errno.ENOTSUP, errno.ENOSYS):
+                raise
     finally:
         if dir_fd is not None:
             try:
@@ -82,7 +87,7 @@ _APPLIED_MAX = 100000
 _APPLIED_EVICT = 1000
 EVENTS_FILE = DATA_DIR / "events.jsonl"
 
-def _schedule_save(fn):
+def _schedule_save(fn, *, wait: bool = False):
     """Async-save: submit на shared pool вместо нового Thread каждый раз.
     Per-save lock с blocking=False уже защищает от concurrent дублей.
 
@@ -92,12 +97,17 @@ def _schedule_save(fn):
     данные попадут на диск ДО exit'а процесса.
     """
     try:
-        _save_executor.submit(fn)
+        future = _save_executor.submit(fn)
     except RuntimeError:
+        if wait:
+            return fn()  # A transactional caller must see write failures.
         try:
             fn()  # sync fallback — writer уже atomic, безопасно
         except Exception as e:
             log_debug(f"_schedule_save sync fallback error: {e}")
+        return
+    if wait:
+        return future.result()
 
 
 # ============================================================
@@ -463,7 +473,8 @@ _save_sessions_lock = threading.Lock()
 def _strip_sensitive_session_fields(s: dict) -> dict:
     """Удалить raw cookie line из сохранённого snapshot — иначе он лежит в
     browser_sessions.json в открытом виде (kimi-search-3 #8)."""
-    out = {k: v for k, v in s.items() if k not in ("_raw_cookie_line", "raw_cookie_line")}
+    out = {k: v for k, v in s.items() if k not in (
+        "_raw_cookie_line", "raw_cookie_line", "_mutation_guard", "_pinned_resume_id")}
     return out
 
 
@@ -484,11 +495,11 @@ def save_browser_sessions(sessions: list, *, wait: bool = False):
     """
     global _sessions_pending_snapshot, _sessions_pending_seq
     target_file = SESSIONS_FILE
-    snapshot = [_strip_sensitive_session_fields(copy.deepcopy(s)) for s in sessions]
     with _sessions_pending_lock:
-        # Каждый новый вызов получает свежий seq. deepcopy сделан выше
-        # (могли долго), но seq присваивается ЗДЕСЬ атомарно с обновлением
-        # pending — конкурентный save с меньшим seq перезаписать не сможет.
+        # Capture and sequence assignment must be one ordered operation: an
+        # older, slow deepcopy must not receive a newer sequence after a
+        # transactional receipt-attempt reservation has already been saved.
+        snapshot = [_strip_sensitive_session_fields(copy.deepcopy(s)) for s in sessions]
         _sessions_pending_seq += 1
         my_seq = _sessions_pending_seq
         _sessions_pending_snapshot = snapshot

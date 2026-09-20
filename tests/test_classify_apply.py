@@ -4,8 +4,21 @@
 как успешные отклики. Покрытие — критично.
 """
 import json
+import pytest
 
 from app.hh_apply import classify_apply_response
+
+
+@pytest.mark.parametrize("flag", ["alreadyApplied", "test-required", "negotiations-limit-exceeded"])
+@pytest.mark.parametrize("value", [False, None, "false", 0])
+def test_false_or_non_boolean_json_flags_are_not_substring_refusals(flag, value):
+    result, _ = classify_apply_response(200, json.dumps({"success": False, flag: value}))
+    assert result == "unknown"
+
+
+def test_markers_in_json_description_are_not_refusals():
+    result, _ = classify_apply_response(200, json.dumps({"description": "alreadyApplied test-required"}))
+    assert result == "unknown"
 
 
 def test_401_is_auth_error():
@@ -52,23 +65,23 @@ def test_200_with_success_true_returns_sent():
     assert result == "sent"
 
 
-def test_200_with_short_vacancy_returns_sent():
+def test_200_with_short_vacancy_without_confirmation_is_unknown():
     body = json.dumps({"responseStatus": {"shortVacancy": {"name": "Backend Dev", "company": {"name": "Yandex"}}}})
     result, info = classify_apply_response(200, body)
-    assert result == "sent"
+    assert result == "unknown"
     assert info["title"] == "Backend Dev"
     assert info["company"] == "Yandex"
 
 
-def test_200_no_markers_is_error_not_sent():
-    """До фикса возвращалось 'sent' для любого 200, теперь без маркеров → error."""
+def test_200_no_markers_is_unknown_not_sent():
+    """Unknown outcome requires reconciliation, not retry or success counting."""
     result, info = classify_apply_response(200, '{"random": "garbage"}')
-    assert result == "error"
+    assert result == "unknown"
 
 
-def test_500_is_error():
+def test_500_is_unknown():
     result, info = classify_apply_response(500, "Internal Server Error")
-    assert result == "error"
+    assert result == "unknown"
 
 
 def test_short_vacancy_extracts_contact_info():
@@ -86,7 +99,7 @@ def test_short_vacancy_extracts_contact_info():
         },
     })
     result, info = classify_apply_response(200, body)
-    assert result == "sent"
+    assert result == "unknown"
     assert info["contact"]["fio"] == "Иванов И.И."
     assert info["contact"]["email"] == "hr@example.com"
     assert info["contact"]["phone"] == "+79991234567"

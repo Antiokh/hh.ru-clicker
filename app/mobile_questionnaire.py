@@ -15,7 +15,79 @@ hh_apply.fill_and_submit_questionnaire. Cookies hh.ru в acc те же, что
 
 import asyncio
 
+import requests
+
 from app import hh_apply
+from app.mobile_auth import MobileAuthError
+
+
+def classify_oauth_bridge_error(exc: Exception) -> tuple:
+    """Classify a failed bridge before any form POST, without exposing its data.
+
+    A local token lookup can fail due to networking; missing tokens and generic
+    exceptions do not prove expired credentials. HTTP 403/429 are protective
+    access/rate stops, never the daily application quota.
+    """
+    chain, seen = [], set()
+    current = exc
+    for _ in range(8):
+        if not isinstance(current, BaseException) or id(current) in seen:
+            break
+        chain.append(current)
+        seen.add(id(current))
+        current = current.__cause__ or current.__context__
+    typed = next((error for error in chain if isinstance(error, MobileAuthError)), None)
+    status = typed.status_code if typed is not None else None
+    kind = typed.error_kind if typed is not None else "other"
+    category, reason, result = "unavailable", "bridge_unavailable", "error"
+    message = "Не удалось подготовить веб-анкету HH. Анкета не отправлена."
+    if status == 429 or kind == "rate_limit":
+        category = reason = "rate_limit"
+        result = "rate_limit"
+        message = "HH временно ограничил частоту запросов. Анкета не отправлена."
+    elif status == 401 or kind == "auth":
+        category = reason = "auth"
+        result = "auth_error"
+        message = "HH не подтвердил авторизацию для веб-анкеты. Анкета не отправлена."
+    elif status == 403 or kind == "challenge":
+        category, result = "challenge", "challenge"
+        reason = "challenge" if kind == "challenge" else "access_denied"
+        message = "HH ограничил доступ к веб-анкете. Требуется проверка доступа; анкета не отправлена."
+    else:
+        for error in chain:
+            for cls, label in (
+                (requests.exceptions.ProxyError, "proxy_error"),
+                (requests.exceptions.SSLError, "tls_error"),
+                (requests.exceptions.ConnectTimeout, "connect_timeout"),
+                (requests.exceptions.ReadTimeout, "read_timeout"),
+                (requests.exceptions.Timeout, "timeout"),
+                (requests.exceptions.ConnectionError, "connection_error"),
+                (requests.exceptions.RequestException, "network_error"),
+                (TimeoutError, "timeout"),
+            ):
+                if isinstance(error, cls):
+                    category, reason = "network", label
+                    break
+            if category == "network":
+                break
+        if category == "network" or kind == "network":
+            category = "network"
+            if reason == "bridge_unavailable":
+                reason = "network_error"
+            message = "Не удалось соединиться с HH для подготовки веб-анкеты. Анкета не отправлена."
+        elif kind in {"token_unavailable", "invalid_response"}:
+            reason = kind
+    info = {"error_type": "oauth_bridge_" + category, "reason": reason,
+            "phase": "oauth_bridge", "dispatched": False, "message": message}
+    if (type(status) is int and 100 <= status <= 599
+            and (kind in {"auth", "challenge", "rate_limit", "denied", "http_error"}
+                 or status in (401, 403, 429))):
+        info["status_code"] = status
+    if result == "rate_limit" and typed is not None:
+        retry = typed.retry_after
+        if type(retry) is int and retry > 0:
+            info["retry_after_seconds"] = min(retry, 86400)
+    return result, info
 
 
 def oauth_web_account_sync(acc: dict) -> dict:
@@ -29,7 +101,8 @@ def oauth_web_account_sync(acc: dict) -> dict:
 
     token = _obtain_oauth_token(acc)
     if not token:
-        raise RuntimeError("Нет действующего OAuth-токена")
+        raise MobileAuthError("Не удалось получить OAuth-токен для веб-анкеты",
+                              status_code=0, error_kind="token_unavailable")
     user_id = str(acc.get("user_id") or "").strip()
     if not user_id:
         counters = HHMobileClient()._request("GET", "me", token=token)
@@ -53,13 +126,17 @@ async def fill_questionnaire(acc: dict, vid: str,
     без преобразования.
 
     Возвращает (result, info) web-функции:
-    result = sent | limit | test | error | auth_error.
+    result = sent | limit | test | error | auth_error | challenge | rate_limit.
     """
     web_acc = acc
     if str(acc.get("mode") or "").strip().lower() == "oauth":
         try:
             web_acc = await oauth_web_account(acc)
         except Exception as exc:
-            return "auth_error", {"error_type": "oauth_autologin_failed", "message": str(exc)}
+            return classify_oauth_bridge_error(exc)
+    # The bridge replaces hhtoken, which participates in the OAuth cache key.
+    # Keep the original identity explicitly, without storing a nested account
+    # reference in a dict that could later be serialized.
+    receipt_kw = {"receipt_account": acc} if web_acc is not acc else {}
     return await hh_apply.fill_and_submit_questionnaire(
-        web_acc, vid, vacancy_title, company)
+        web_acc, vid, vacancy_title, company, **receipt_kw)

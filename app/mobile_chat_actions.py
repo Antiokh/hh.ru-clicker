@@ -51,7 +51,7 @@ def fetch_quick_replies(acc: dict, chat_id: str, message_id: str) -> list:
     try:
         data = mobile_request(acc, "PUT", url, params={"message_id": message_id})
     except MobileAPIError as e:
-        if is_fallback_status(e.status_code):
+        if e.outcome_unknown or is_fallback_status(e.status_code):
             raise
         log_debug(f"mobile fetch_quick_replies chat={chat_id} msg={message_id}: HTTP {e.status_code}")
         return []
@@ -88,7 +88,7 @@ def mark_chat_read(acc: dict, chat_id: str, message_id: str) -> bool:
     try:
         mobile_request(acc, "PUT", url, form={"message_id": str(message_id)})
     except MobileAPIError as e:
-        if is_fallback_status(e.status_code):
+        if e.outcome_unknown or is_fallback_status(e.status_code):
             raise
         log_debug(f"mobile mark_chat_read chat={chat_id} msg={message_id}: HTTP {e.status_code}")
         return False
@@ -110,7 +110,7 @@ def send_participant_action(acc: dict, chat_id: str, action_type: str = "TYPING"
     try:
         mobile_request(acc, "PUT", url, json_body={"action_type": normalized})
     except MobileAPIError as e:
-        if is_fallback_status(e.status_code):
+        if e.outcome_unknown or is_fallback_status(e.status_code):
             raise
         log_debug(f"mobile send_participant_action chat={chat_id} action={normalized}: HTTP {e.status_code}")
         return False
@@ -137,7 +137,7 @@ def send_event(acc: dict, chat_id: str, event_type: str, event_params: dict | No
             json_body={"event_type": normalized_type, "event_params": params},
         )
     except MobileAPIError as e:
-        if is_fallback_status(e.status_code):
+        if e.outcome_unknown or is_fallback_status(e.status_code):
             raise
         log_debug(f"mobile send_event chat={chat_id} event={normalized_type}: HTTP {e.status_code}")
         return False
