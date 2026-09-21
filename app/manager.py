@@ -28,7 +28,11 @@ from app.logging_utils import log_debug, log_exception, _is_login_page
 from app.vacancy_signals import normalize_vacancy_signals, vacancy_signal_priority
 from app.vacancy_salary import salary_for_ruble_threshold
 from app.mutation_safety import MutationBlocked, ensure_mutation_allowed
-from app.search_scope import remote_it_filters, remote_it_url, remote_it_rejection, scope_metadata
+from app.search_scope import (
+    remote_it_filters, remote_it_url, remote_it_rejection,
+    vacancy_scope_rejection, scope_metadata,
+)
+from app.hh_areas import country_for_area
 from app.apply_quarantine import blocked as quarantine_blocked
 from app.telegram_notify import is_configured as telegram_is_configured, send_once as telegram_send_once
 
@@ -67,7 +71,7 @@ def _mobile_search_filters(filters: dict) -> dict:
     locally sorted result can still miss the globally newest vacancies.
     """
     result = dict(filters or {})
-    if CONFIG.remote_it_only:
+    if CONFIG.remote_it_only and not (CONFIG.local_country_only or CONFIG.relocation_country_only):
         result = remote_it_filters(result)
     labels = result.get("label", [])
     labels = list(labels) if isinstance(labels, (list, tuple)) else [labels]
@@ -2179,6 +2183,10 @@ class BotManager:
                 "llm_check_interval": CONFIG.llm_check_interval,
                 "allowed_schedules": CONFIG.allowed_schedules,
                 "remote_it_only": CONFIG.remote_it_only,
+                "local_country_only": CONFIG.local_country_only,
+                "local_country_id": CONFIG.local_country_id,
+                "relocation_country_only": CONFIG.relocation_country_only,
+                "relocation_country_ids": CONFIG.relocation_country_ids,
                 "title_include_keywords": getattr(CONFIG, "title_include_keywords", []),
                 "title_exclude_keywords": getattr(CONFIG, "title_exclude_keywords", []),
                 "questionnaire_templates": CONFIG.questionnaire_templates,
@@ -2506,6 +2514,20 @@ class BotManager:
                 time.sleep(60)
                 continue
 
+            # Keep schedule data with vacancy metadata so the geography guard
+            # can re-check the exact candidate immediately before submission.
+            for vid, schedules in schedule_map.items():
+                if schedules:
+                    state.vacancy_meta.setdefault(vid, {})["work_schedules"] = sorted(schedules)
+            if CONFIG.local_country_only or CONFIG.relocation_country_only:
+                for meta in state.vacancy_meta.values():
+                    if meta.get("area_id"):
+                        try:
+                            meta["country_id"] = country_for_area(meta["area_id"])
+                        except Exception as exc:
+                            log_debug(f"HH area directory unavailable: {type(exc).__name__}: {exc}")
+                            break
+
             all_vacancies = []
             set_activity(state, "filter", "Объединяет результаты и проверяет дополнительные подборки HH",
                 "Исключит неподходящие и уже обработанные вакансии")
@@ -2659,8 +2681,15 @@ class BotManager:
                 meta = state.vacancy_meta.get(vid, {})
                 title = (meta.get("title") or "").lower()
                 log_debug(f"Processing vacancy {vid}: {title}")
-                if CONFIG.remote_it_only:
-                    scope_reason = remote_it_rejection(meta)
+                if CONFIG.remote_it_only or CONFIG.local_country_only or CONFIG.relocation_country_only:
+                    scope_reason = vacancy_scope_rejection(
+                        meta,
+                        remote_it_only=CONFIG.remote_it_only,
+                        local_country_only=CONFIG.local_country_only,
+                        local_country_id=CONFIG.local_country_id,
+                        relocation_country_only=CONFIG.relocation_country_only,
+                        relocation_country_ids=CONFIG.relocation_country_ids,
+                    )
                     if scope_reason:
                         cycle_outcome(state, vid, 'skipped', scope_reason)
                         continue
@@ -3003,7 +3032,12 @@ class BotManager:
                 attempt_accounts = {vid: dict(acc) for vid in batch}
                 for scope_vid, attempt_acc in attempt_accounts.items():
                     attempt_acc['_mutation_guard'] = lambda vid=scope_vid: self._can_mutate(state) and not quarantine_blocked(state.acc, vid) and (
-                        not CONFIG.remote_it_only or remote_it_rejection(state.vacancy_meta.get(vid, {})) is None)
+                        not (CONFIG.remote_it_only or CONFIG.local_country_only or CONFIG.relocation_country_only) or vacancy_scope_rejection(
+                            state.vacancy_meta.get(vid, {}), remote_it_only=CONFIG.remote_it_only,
+                            local_country_only=CONFIG.local_country_only, local_country_id=CONFIG.local_country_id,
+                            relocation_country_only=CONFIG.relocation_country_only,
+                            relocation_country_ids=CONFIG.relocation_country_ids,
+                        ) is None)
                 # Pre-check: skip inconsistent vacancies if enabled
                 if state.safety_enabled:
                     set_activity(state, "preflight", "Проверяет вакансии и выбранное резюме перед отправкой",
@@ -3763,7 +3797,7 @@ class BotManager:
             sep = "&" if "?" in url else "?"
             for page in range(pages):
                 page_url = f"{url}{sep}page={page}{extra_params}"
-                if CONFIG.remote_it_only:
+                if CONFIG.remote_it_only and not (CONFIG.local_country_only or CONFIG.relocation_country_only):
                     page_url = remote_it_url(page_url)
                 all_tasks.append((url_idx, url, page, page_url))
 
