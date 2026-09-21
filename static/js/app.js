@@ -3705,7 +3705,7 @@ function renderAccounts(snap) {
     if (!card) {
       card = document.createElement('div');
       card.id = 'card-' + acc.idx;
-      card.className = 'acc-card color-' + (acc.color || 'yellow');
+      card.className = 'acc-card card color-' + (acc.color || 'yellow');
       card.dataset.accountIdentity = identity;
       card.innerHTML = buildCardHTML(acc);
       grid.appendChild(card);
@@ -3713,7 +3713,7 @@ function renderAccounts(snap) {
       // подряд + 700KB SSR HTML каждый. Отложим на 2с после первого рендера.
       setTimeout(() => _accDiagAutoLoad(acc.idx), 2000 + acc.idx * 500);
     } else {
-      card.className = 'acc-card color-' + (acc.color || 'yellow');
+      card.className = 'acc-card card color-' + (acc.color || 'yellow');
       updateCard(card, acc);
     }
   });

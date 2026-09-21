@@ -42,6 +42,8 @@ Thumbs.db
 *.log
 
 # Local tooling
+/package/
+/tabler-core-*.tgz
 .venv/
 .openclaw/
 AGENTS.md
