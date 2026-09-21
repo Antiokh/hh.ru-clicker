@@ -4,7 +4,6 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>HH Bot Dashboard</title>
-<link rel="stylesheet" href="/static/css/style.css?v=state-readable-4">
 <!-- UI integrations (feat1..feat8) -->
 <link rel="stylesheet" href="/static/css/features/feat1_hr_badge.css">
 <link rel="stylesheet" href="/static/css/features/feat2_preflight.css">
@@ -20,7 +19,7 @@
 <body class="layout-fluid">
 
 <!-- Header -->
-<header id="header" class="navbar navbar-expand-md navbar-light bg-white border-bottom sticky-top">
+<header id="header" class="navbar navbar-expand-md border-bottom sticky-top">
   <div id="conn-dot" title="WebSocket connection"></div>
   <h1 class="navbar-brand mb-0">HH Bot Dashboard</h1>
   <div style="color:var(--dim);font-size:11px">
@@ -39,6 +38,7 @@
   <div id="uptime">⏱ 00:00</div>
   <div id="dbg-err" style="display:none;color:#f85149;font-size:11px;max-width:400px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap"></div>
   <button id="lang-btn" class="btn btn-sm btn-outline-secondary" onclick="toggleLang()" title="Switch language">RU</button>
+  <button id="theme-btn" class="btn btn-sm btn-outline-secondary" type="button" title="Переключить тему"></button>
   <button id="pause-btn" class="btn btn-sm btn-outline-warning" onclick="sendCmd({type:'pause_toggle'})">⏸ Пауза</button>
   <span id="apply-mode-badge" style="padding:3px 8px;border-radius:4px;font-size:10px;font-weight:600;cursor:pointer" onclick="sendCmd({type:'set_config',key:'use_oauth_apply',value:!State.lastSnapshot?.config?.use_oauth_apply})" title="Клик — переключить метод откликов"></span>
   <span id="reviews-to-rate-badge" style="display:none;padding:3px 8px;border-radius:4px;font-size:10px;font-weight:600;cursor:pointer;background:rgba(255,180,0,0.12);border:1px solid var(--yellow);color:var(--yellow)" title="Работодатели, которых можно оценить (mobile /employer_reviews/employers_to_rate)"></span>
